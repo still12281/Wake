@@ -6,26 +6,56 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Antigravity CLI(Google,binary `agy`):会话正文是加密 .pb,唯一明文是
-/// `~/.gemini/antigravity-cli/conversation_summaries.db`(WAL)——只能做
-/// 元数据级会话卡片:标题在 preview 列(title 列基本为空)、时间、workspace。
-/// 详情页由一条 System 消息承载 preview 与"正文加密"说明,FTS 只搜得到它。
-/// 无每会话文件,SessionFileRef 用虚拟路径;打开一律走 sqlite_ro 三级梯度。
+/// Antigravity CLI / IDE:
+/// 会话索引在 `~/.gemini/antigravity/conversation_summaries.db`(或旧版 `antigravity-cli`)，
+/// 会话完整明文记录在 `~/.gemini/antigravity/brain/<id>/.system_generated/logs/transcript.jsonl`。
+/// 若 transcript.jsonl 存在，则解析全量对话正文（用户提问、模型回答、思考过程、工具调用与结果）；
+/// 若不存在，则优雅降级为 SQLite 中的 preview 摘要。
 pub struct AntigravityAdapter {
     db: PathBuf,
+    brain_dir: PathBuf,
     /// 全表很小(元数据行),按 db mtime 缓存一轮扫描内的重复调用
     rows_cache: MtimeCache<Vec<AgRow>>,
 }
 
 impl AntigravityAdapter {
     pub fn new() -> Self {
+        let gemini = super::home_dir().unwrap_or_default().join(".gemini");
+        let (db, brain_dir) = if gemini
+            .join("antigravity")
+            .join("conversation_summaries.db")
+            .exists()
+        {
+            (
+                gemini.join("antigravity").join("conversation_summaries.db"),
+                gemini.join("antigravity").join("brain"),
+            )
+        } else {
+            (
+                gemini
+                    .join("antigravity-cli")
+                    .join("conversation_summaries.db"),
+                gemini.join("antigravity-cli").join("brain"),
+            )
+        };
         Self {
-            db: super::home_dir()
-                .unwrap_or_default()
-                .join(".gemini")
-                .join("antigravity-cli")
-                .join("conversation_summaries.db"),
+            db,
+            brain_dir,
             rows_cache: MtimeCache::new(),
+        }
+    }
+
+    fn resolve_brain_dir(&self) -> PathBuf {
+        if self.brain_dir.is_dir() {
+            self.brain_dir.clone()
+        } else if let Some(parent) = self.db.parent() {
+            if parent.join("brain").is_dir() {
+                parent.join("brain")
+            } else {
+                self.brain_dir.clone()
+            }
+        } else {
+            self.brain_dir.clone()
         }
     }
 
@@ -48,7 +78,9 @@ impl AntigravityAdapter {
                         title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                         preview: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                         step_count: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                        modified_ms: sqlite_dt_ms(r.get::<_, Option<String>>(4)?.unwrap_or_default().trim()),
+                        modified_ms: sqlite_dt_ms(
+                            r.get::<_, Option<String>>(4)?.unwrap_or_default().trim(),
+                        ),
                         cwd: first_workspace(&r.get::<_, Option<String>>(5)?.unwrap_or_default()),
                     })
                 })
@@ -59,17 +91,36 @@ impl AntigravityAdapter {
         })
     }
 
-    fn build_meta(&self, r: &SessionFileRef, row: &AgRow) -> SessionMeta {
+    fn build_meta(
+        &self,
+        r: &SessionFileRef,
+        row: &AgRow,
+        messages: &[TranscriptMessage],
+    ) -> SessionMeta {
         let title = Some(clean_title_candidate(&row.title))
             .filter(|t| !t.is_empty())
             .or_else(|| Some(clean_title_candidate(&row.preview)).filter(|t| !t.is_empty()))
+            .or_else(|| title_from_messages(messages))
             .unwrap_or_else(|| UNTITLED.to_string());
-        // 库里只有 last_modified 一个时间,created/updated 同源
-        let ts = if row.modified_ms > 0 {
+
+        let first_ts = messages.iter().find_map(|m| m.timestamp);
+        let last_ts = messages.iter().rev().find_map(|m| m.timestamp);
+        let created_at = first_ts.unwrap_or(if row.modified_ms > 0 {
             row.modified_ms
         } else {
             r.mtime_ms
+        });
+        let updated_at = last_ts.unwrap_or(if row.modified_ms > 0 {
+            row.modified_ms
+        } else {
+            r.mtime_ms
+        });
+        let message_count = if messages.is_empty() {
+            row.step_count
+        } else {
+            messages.len() as i64
         };
+
         SessionMeta {
             key: format!("antigravity:{}", row.id),
             host: String::new(),
@@ -79,9 +130,9 @@ impl AntigravityAdapter {
             project_path: row.cwd.clone(),
             project_name: project_name_of(&row.cwd),
             file_path: r.file_path.clone(),
-            created_at: ts,
-            updated_at: ts,
-            message_count: row.step_count,
+            created_at,
+            updated_at,
+            message_count,
             size_bytes: r.size,
             git_branch: None,
             model: None,
@@ -90,6 +141,131 @@ impl AntigravityAdapter {
             source: None,
             favorite: false,
             pinned: false,
+        }
+    }
+
+    fn parse_transcript_jsonl(&self, native_id: &str) -> Option<Vec<TranscriptMessage>> {
+        let brain = self.resolve_brain_dir();
+        let transcript = brain
+            .join(native_id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        if !transcript.is_file() {
+            return None;
+        }
+
+        let file = std::fs::File::open(&transcript).ok()?;
+        let reader = std::io::BufReader::new(file);
+        let mut messages: Vec<TranscriptMessage> = Vec::new();
+
+        use std::io::BufRead;
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(val) => val,
+                Err(_) => continue,
+            };
+
+            let source = v.get("source").and_then(|s| s.as_str()).unwrap_or("");
+            let step_type = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+            let ts = iso_ms(v.get("created_at").and_then(|s| s.as_str()).unwrap_or(""));
+
+            match step_type {
+                "USER_INPUT" => {
+                    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let user_text = extract_user_request(content);
+                    if !user_text.is_empty() {
+                        let role =
+                            if source == "SYSTEM" || user_text.starts_with("<SYSTEM_MESSAGE>") {
+                                Role::System
+                            } else {
+                                Role::User
+                            };
+                        messages.push(text_msg(role, &user_text, ts));
+                    }
+                }
+                "PLANNER_RESPONSE" if source == "MODEL" => {
+                    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let thinking = v
+                        .get("thinking")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| clip(s.trim(), MAX_TOOL_IO).0);
+
+                    let mut tool_calls = Vec::new();
+                    if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
+                        for tc in calls {
+                            let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                            let args = tc.get("args").unwrap_or(&serde_json::Value::Null);
+                            tool_calls.push(tool_call_view(
+                                String::new(),
+                                name,
+                                args,
+                                None,
+                                false,
+                            ));
+                        }
+                    }
+
+                    if !content.trim().is_empty() || thinking.is_some() || !tool_calls.is_empty() {
+                        let mut msg = text_msg(Role::Assistant, content, ts);
+                        msg.thinking = thinking;
+                        msg.tool_calls = tool_calls;
+                        messages.push(msg);
+                    }
+                }
+                "GENERIC" if source == "MODEL" => {
+                    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    if !content.trim().is_empty() {
+                        if let Some(last_asst) =
+                            messages.iter_mut().rev().find(|m| m.role == Role::Assistant)
+                        {
+                            if let Some(tc) =
+                                last_asst.tool_calls.iter_mut().find(|tc| tc.output.is_none())
+                            {
+                                let (clipped, _) = clip(content, MAX_TOOL_IO);
+                                tc.output = Some(clipped);
+                            }
+                        }
+                    }
+                }
+                "ERROR_MESSAGE" => {
+                    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    if !content.trim().is_empty() {
+                        if let Some(last_asst) =
+                            messages.iter_mut().rev().find(|m| m.role == Role::Assistant)
+                        {
+                            if let Some(tc) =
+                                last_asst.tool_calls.iter_mut().find(|tc| tc.output.is_none())
+                            {
+                                let (clipped, _) = clip(content, MAX_TOOL_IO);
+                                tc.output = Some(clipped);
+                                tc.is_error = true;
+                            } else {
+                                messages.push(text_msg(Role::System, content, ts));
+                            }
+                        } else {
+                            messages.push(text_msg(Role::System, content, ts));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !messages.is_empty() {
+            assign_seq(&mut messages);
+            Some(messages)
+        } else {
+            None
         }
     }
 
@@ -102,16 +278,25 @@ impl AntigravityAdapter {
             .find(|x| x.id == r.native_id)
             .ok_or_else(|| anyhow!("antigravity conversation {} not in store", r.native_id))?;
 
-        // 正文加密不可读:一条 System 消息承载 preview,详情页与 FTS 都有着落
-        let mut text = String::new();
-        if !row.preview.trim().is_empty() {
-            text.push_str(row.preview.trim());
-            text.push_str("\n\n");
-        }
-        text.push_str("Antigravity stores conversation content encrypted — only this summary is available in Wake.");
-        let mut messages = vec![text_msg(Role::System, &text, row.modified_ms)];
-        assign_seq(&mut messages);
-        Ok((self.build_meta(r, row), messages))
+        let messages = match self.parse_transcript_jsonl(&r.native_id) {
+            Some(msgs) if !msgs.is_empty() => msgs,
+            _ => {
+                let mut text = String::new();
+                if !row.preview.trim().is_empty() {
+                    text.push_str(row.preview.trim());
+                    text.push_str("\n\n");
+                }
+                text.push_str(
+                    "Antigravity stores conversation content encrypted — only this summary is available in Wake.",
+                );
+                let mut fallback = vec![text_msg(Role::System, &text, row.modified_ms)];
+                assign_seq(&mut fallback);
+                fallback
+            }
+        };
+
+        let meta = self.build_meta(r, row, &messages);
+        Ok((meta, messages))
     }
 }
 
@@ -123,6 +308,26 @@ struct AgRow {
     step_count: i64,
     modified_ms: i64,
     cwd: String,
+}
+
+/// 从 Antigravity 的 content 中提取 <USER_REQUEST>…</USER_REQUEST> 内的用户真实输入。
+/// 若无标签则剥离末尾的系统元数据块（如 <ADDITIONAL_METADATA>、<USER_SETTINGS_CHANGE>）。
+fn extract_user_request(content: &str) -> String {
+    const START: &str = "<USER_REQUEST>";
+    const END: &str = "</USER_REQUEST>";
+    if let Some(s) = content.find(START) {
+        if let Some(e) = content[s..].find(END) {
+            return content[s + START.len()..s + e].trim().to_string();
+        }
+    }
+    let mut text = content.trim();
+    if let Some(pos) = text.find("<ADDITIONAL_METADATA>") {
+        text = text[..pos].trim();
+    }
+    if let Some(pos) = text.find("<USER_SETTINGS_CHANGE>") {
+        text = text[..pos].trim();
+    }
+    text.to_string()
 }
 
 /// workspace_uris JSON 数组("[\"file:///Users/…\"]")首项 → 本地路径
@@ -169,15 +374,34 @@ impl AgentAdapter for AntigravityAdapter {
         let Some(rows) = self.rows() else {
             return Ok(Vec::new());
         };
+        let brain = self.resolve_brain_dir();
         Ok(rows
             .into_iter()
-            .map(|row| SessionFileRef {
-                agent: AgentId::Antigravity,
-                native_id: row.id.clone(),
-                file_path: virtual_path(&self.db, &row.id),
-                mtime_ms: row.modified_ms,
-                // 正文不可读,标题/preview 长度即内容指纹(dirty 判断用)
-                size: (row.title.len() + row.preview.len()) as i64,
+            .map(|row| {
+                let transcript = brain
+                    .join(&row.id)
+                    .join(".system_generated")
+                    .join("logs")
+                    .join("transcript.jsonl");
+                let (mtime_ms, size) = if let Ok(meta) = std::fs::metadata(&transcript) {
+                    let m = super::parse_utils::mtime_ms(&meta);
+                    (
+                        if m > 0 { m } else { row.modified_ms },
+                        meta.len() as i64,
+                    )
+                } else {
+                    (
+                        row.modified_ms,
+                        (row.title.len() + row.preview.len()) as i64,
+                    )
+                };
+                SessionFileRef {
+                    agent: AgentId::Antigravity,
+                    native_id: row.id.clone(),
+                    file_path: virtual_path(&self.db, &row.id),
+                    mtime_ms,
+                    size,
+                }
             })
             .collect())
     }
@@ -188,7 +412,7 @@ impl AgentAdapter for AntigravityAdapter {
         let mut out = HashMap::new();
         for r in refs {
             if let Some(row) = by_id.get(r.native_id.as_str()) {
-                out.insert(r.file_path.clone(), self.build_meta(r, row));
+                out.insert(r.file_path.clone(), self.build_meta(r, row, &[]));
             }
         }
         Some(out)
@@ -210,20 +434,21 @@ impl AgentAdapter for AntigravityAdapter {
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
-        // 选中 `~/.gemini` 形态(含 antigravity-cli/)、库所在目录,或直接
-        // 给到库文件路径都认(Codex review)
-        let nested = dir
-            .join("antigravity-cli")
-            .join("conversation_summaries.db");
-        let db = if dir.is_file() {
-            dir
-        } else if nested.is_file() {
-            nested
+        let nested_new = dir.join("antigravity").join("conversation_summaries.db");
+        let nested_old = dir.join("antigravity-cli").join("conversation_summaries.db");
+        let (db, brain_dir) = if dir.is_file() {
+            let parent = dir.parent().unwrap_or(&dir);
+            (dir.clone(), parent.join("brain"))
+        } else if nested_new.is_file() {
+            (nested_new, dir.join("antigravity").join("brain"))
+        } else if nested_old.is_file() {
+            (nested_old, dir.join("antigravity-cli").join("brain"))
         } else {
-            dir.join("conversation_summaries.db")
+            (dir.join("conversation_summaries.db"), dir.join("brain"))
         };
         Box::new(Self {
             db,
+            brain_dir,
             rows_cache: MtimeCache::new(),
         })
     }
