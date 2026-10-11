@@ -175,7 +175,10 @@ impl Workbench {
             .px(SPACE_XXL)
             .gap(SPACE_MD)
             .items_start()
-            .window_control_area(WindowControlArea::Drag)
+            // 同 library_header:Windows 上禁用拖拽区,保住"返回"按钮点击。
+            .when(!cfg!(target_os = "windows"), |d| {
+                d.window_control_area(WindowControlArea::Drag)
+            })
             .child(
                 div().pt(zpx(24.)).child(
                     Button::new("cleanup-history-back")

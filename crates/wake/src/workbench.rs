@@ -152,7 +152,11 @@ fn library_header(
         .w_full()
         .h(LIBRARY_IDENTITY_HEIGHT)
         .flex_shrink_0()
-        .window_control_area(WindowControlArea::Drag)
+        // Windows 用系统原生标题栏(SSD),头部 Drag 区会把按钮点击当标题栏拖拽吞掉;
+        // 仅无边框平台(macOS/Linux)使用拖拽区。
+        .when(!cfg!(target_os = "windows"), |d| {
+            d.window_control_area(WindowControlArea::Drag)
+        })
         .px(inset)
         .justify_center()
         .child(
@@ -9536,7 +9540,10 @@ fn detail_header_frame(
     v_flex()
         .id(id)
         .flex_shrink_0()
-        .window_control_area(WindowControlArea::Drag)
+        // 同 library_header:Windows 上禁用拖拽区,保住头部按钮点击。
+        .when(!cfg!(target_os = "windows"), |d| {
+            d.window_control_area(WindowControlArea::Drag)
+        })
         .px(SPACE_XXL)
         .pb(SPACE_SM)
         .border_b_1()
