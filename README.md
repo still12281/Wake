@@ -1,11 +1,21 @@
 # Wake
 
-[![License](https://img.shields.io/github/license/iAmCorey/Wake?style=flat-square)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/iAmCorey/Wake?style=flat-square)](https://github.com/iAmCorey/Wake/releases/latest)
-[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%7C%20Linux%20beta%20%7C%20Windows%20beta-007AFF?style=flat-square)](https://github.com/iAmCorey/Wake/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/iAmCorey/Wake/total?style=flat-square)](https://github.com/iAmCorey/Wake/releases)
-[![Stars](https://img.shields.io/github/stars/iAmCorey/Wake?style=flat-square)](https://github.com/iAmCorey/Wake/stargazers)
-[![CI](https://img.shields.io/github/actions/workflow/status/iAmCorey/Wake/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/iAmCorey/Wake/actions/workflows/ci.yml)
+> ### 个人 fork · Windows 11 修复版
+>
+> 本仓库是 [Wake](https://github.com/iAmCorey/Wake)（原作者 [@iAmCorey](https://github.com/iAmCorey)）的**个人 fork**，
+> 基于上游 **v0.9.1** 叠加 7 项 Windows 适配修复（上游功能文档见下文）。
+>
+> **⬇️ 下载最新构建：[Releases · latest](https://github.com/still12281/Wake/releases/latest)**
+> （`v0.9.1-win11-fix`，Windows x86_64：`Wake.exe` / `wake-cli.exe` / `wake-mcp.exe`）
+>
+> 修复清单：头部按钮点击（拖拽区命中）· `/d:` 路径污染 · 会话正文文件链接 · Antigravity 规约与持久记忆接入 · MCP `project=` 过滤大小写/分隔符折叠 · 路径 canonical 化 · 双层编码解包（双反斜杠）· Antigravity 索引库路径探测。
+
+[![License](https://img.shields.io/github/license/still12281/Wake?style=flat-square)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/still12281/Wake?style=flat-square)](https://github.com/still12281/Wake/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-macOS%2014%2B%20%7C%20Linux%20beta%20%7C%20Windows%20beta-007AFF?style=flat-square)](https://github.com/still12281/Wake/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/still12281/Wake/total?style=flat-square)](https://github.com/still12281/Wake/releases)
+[![Stars](https://img.shields.io/github/stars/still12281/Wake?style=flat-square)](https://github.com/still12281/Wake/stargazers)
+[![CI](https://img.shields.io/github/actions/workflow/status/still12281/Wake/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/still12281/Wake/actions/workflows/ci.yml)
 
 A native desktop app that gathers every coding-agent session on your machine into one place — browse, full-text search, and resume any conversation in seconds. Built with **Rust + GPUI** (gpui 0.2 + gpui-component 0.5). macOS first; experimental Linux support since v0.2.5, experimental Windows support since v0.2.7.
 
@@ -23,7 +33,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex`, and a dozen othe
 - **Insights** — a stats page for your whole library: GitHub-style activity heatmap with streaks, hour / weekday / month breakdowns, and Agents / Projects / Models leaderboards switchable between sessions, tokens, and prompts
 - **Remote hosts** — mirror the sessions on your other machines over SSH (Settings → Remote hosts); they show up next to local ones with an `@host` badge, searchable like everything else, and resume through a copied `ssh -t` command
 - **Connect your agents (MCP)** — a bundled read-only MCP server, `wake-mcp`, lets Claude Code, Codex, Cursor or any MCP client search your whole history, list recent sessions per project and read transcripts page by page, so a new agent can pick up where another one left off; Settings → Connect has copy-paste setup snippets
-- **Command line** — `wake-cli` gives the same answers to anything that can run a shell command: `wake-cli sessions --project "$PWD"`, `wake-cli search "…"`, `wake-cli show <key>`; it prints the same text an MCP client sees; `npx skills add iAmCorey/Wake` installs a skill so agents reach for it on their own; `wake-cli refresh` keeps the index fresh from a scheduled task while the app is closed
+- **Command line** — `wake-cli` gives the same answers to anything that can run a shell command: `wake-cli sessions --project "$PWD"`, `wake-cli search "…"`, `wake-cli show <key>`; it prints the same text an MCP client sees; `npx skills add still12281/Wake` installs a skill so agents reach for it on their own; `wake-cli refresh` keeps the index fresh from a scheduled task while the app is closed
 
 ![Full-text search across every agent's sessions](imgs/screenshot-2.webp)
 
@@ -134,7 +144,7 @@ wake-cli refresh                                  # update the index while Wake 
 
 It prints what the MCP tools return, asserted byte for byte in the test suite apart from a trailing newline the CLI adds, so an agent driving it through a shell sees what a connected one does. Full reference in [docs/cli.md](docs/cli.md).
 
-To make an agent reach for it without being told, install the bundled skill with `npx skills add iAmCorey/Wake` (or copy `skills/wake/` into `~/.claude/skills/wake/`). Every new session can also start knowing where your agents left off in the project — Claude Code, Codex and the rest, each with its last question and reply: for Claude Code, `claude plugin marketplace add iAmCorey/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake` installs the Wake plugin, which does this and adds Wake's MCP tools in one go ([Claude Code plugin](docs/cli.md#claude-code-plugin)); for Codex, `codex plugin marketplace add iAmCorey/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake` installs the same plugin ([Codex plugin](docs/cli.md#codex-plugin)). Both are in Settings → Connect.
+To make an agent reach for it without being told, install the bundled skill with `npx skills add still12281/Wake` (or copy `skills/wake/` into `~/.claude/skills/wake/`). Every new session can also start knowing where your agents left off in the project — Claude Code, Codex and the rest, each with its last question and reply: for Claude Code, `claude plugin marketplace add still12281/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake` installs the Wake plugin, which does this and adds Wake's MCP tools in one go ([Claude Code plugin](docs/cli.md#claude-code-plugin)); for Codex, `codex plugin marketplace add still12281/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake` installs the same plugin ([Codex plugin](docs/cli.md#codex-plugin)). Both are in Settings → Connect.
 
 ## Zoom
 
@@ -167,10 +177,13 @@ On the author's machine (~310 sessions, ~800 MB of JSONL): full index ~5 s, subs
 
 ## Install
 
+> **本 fork 只发布 Windows 构建**（见下方 Windows 一节）：[Releases · latest](https://github.com/still12281/Wake/releases/latest)。
+> macOS 版请使用[上游 release](https://github.com/iAmCorey/Wake/releases/latest)，或从源码构建。
+
 Download `Wake-<version>-macos.zip` from the [latest release](https://github.com/iAmCorey/Wake/releases/latest), unzip, and drag Wake to Applications. The release is a Universal Binary for both Apple Silicon and Intel Macs. Or build from source (requires a Rust toolchain):
 
 ```bash
-git clone https://github.com/iAmCorey/Wake && cd Wake
+git clone https://github.com/still12281/Wake && cd Wake
 scripts/make-app.sh          # builds dist/Wake.app (icon + Info.plist, ad-hoc signed)
 open dist/Wake.app
 ```
@@ -186,7 +199,7 @@ Prebuilt packages for arm64 and x86_64 (asset names use Debian's `amd64`) are at
 ```bash
 sudo apt-get install -y libasound2-dev libfontconfig1-dev libwayland-dev \
   libxkbcommon-dev libxkbcommon-x11-dev libssl-dev libzstd-dev pkg-config cmake clang
-git clone https://github.com/iAmCorey/Wake && cd Wake
+git clone https://github.com/still12281/Wake && cd Wake
 scripts/make-linux.sh        # builds dist/wake-<version>-linux-<arch>.tar.gz and .deb
 ```
 
@@ -194,10 +207,12 @@ The data layer, rendering and search are fully tested on Linux; terminal-resume 
 
 ### Windows (experimental)
 
-Download `wake-<version>-windows-x86_64.zip` from the [latest release](https://github.com/iAmCorey/Wake/releases/latest), unzip, and run `Wake.exe` — the binary is unsigned, so SmartScreen may block the first launch (click *More info* → *Run anyway*). Or build from source (requires a Rust toolchain with the MSVC target):
+> **本 fork 提供含 Windows 修复的构建**：[Releases · latest](https://github.com/still12281/Wake/releases/latest)（`wake-<version>-windows-x86_64.zip`，基于上游 v0.9.1 + 文首所列修复）。
+
+Download `wake-<version>-windows-x86_64.zip` from the [latest release](https://github.com/still12281/Wake/releases/latest), unzip, and run `Wake.exe` — the binary is unsigned, so SmartScreen may block the first launch (click *More info* → *Run anyway*). Or build from source (requires a Rust toolchain with the MSVC target):
 
 ```powershell
-git clone https://github.com/iAmCorey/Wake; cd Wake
+git clone https://github.com/still12281/Wake; cd Wake
 powershell -ExecutionPolicy Bypass -File scripts/make-windows.ps1   # builds dist/wake-<version>-windows-<arch>.zip
 # or just: cargo run -p wake
 ```
@@ -246,9 +261,6 @@ crates/
 
 Design notes live in [DESIGN.md](DESIGN.md), product decisions in [PRODUCT.md](PRODUCT.md), release history in [CHANGELOG.md](CHANGELOG.md).
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/chart?repos=iAmCorey/Wake&type=date&legend=top-left&sealed_token=ZX5h8laOXIE38b__FRNpP7ae52yRupThIRrcgidF7RI0OOzVcsKIo1iJ_iDp6UcMoxzNCL99N3RY__N7TFUszIgxzljBSBRRiAPYPt9QC9lKf7X3ShAQJg)](https://www.star-history.com/?type=date&repos=iAmCorey%2FWake)
 
 ## License
 
