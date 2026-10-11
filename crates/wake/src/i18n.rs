@@ -624,6 +624,7 @@ mod tests {
             include_str!("workbench/memory.rs"),
             include_str!("settings.rs"),
             include_str!("main.rs"),
+            include_str!("ui_zoom.rs"),
             include_str!("index_lock.rs"),
             include_str!("markdown_links.rs"),
             include_str!("format.rs"),
@@ -647,10 +648,15 @@ mod tests {
     /// (`t(s.hint)` / `t(s.copy_label)`),所以这些 key 的英文原文不在 UI 源码里,
     /// 而在 `setup_snippets` 里。**不要把它们塞进 `assembled_elsewhere`**——
     /// wake-core 不参与 i18n,可以随时改这些字面量,恰恰最需要棘轮看着;
-    /// 这里直接问那个 API,改了名就在这里红,而不是变成一条静默的死译文
+    /// 这里直接问那个 API,改了名就在这里红,而不是变成一条静默的死译文。开场上下文的两块
+    /// 在 Windows 上不显示,但片段函数不分平台、语言包也不分平台,所以这里照列
     fn from_wake_core(key: &str) -> bool {
         wake_core::mcp::setup_snippets(std::path::Path::new("x"))
-            .iter()
+            .into_iter()
+            .chain([
+                wake_core::cli::claude_plugin_snippet(),
+                wake_core::cli::codex_plugin_snippet(),
+            ])
             .any(|s| s.hint == key || s.copy_label == key)
     }
 
@@ -661,7 +667,7 @@ mod tests {
             "Move to ",
             "Session moved to ",
             "{} sessions moved to ",
-            "The session file will be moved to ",
+            "This file will be moved to ",
             "You can restore files from ",
             "Show in ",
             "Reveal in ",

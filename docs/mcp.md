@@ -12,7 +12,7 @@ It covers everything Wake indexes: sessions from every supported agent on this m
 | Linux | next to `wake`: `~/.local/bin/wake-mcp` (tar.gz install) or `/usr/bin/wake-mcp` (deb) |
 | Windows | next to `Wake.exe` in the unpacked zip |
 
-Settings → Connect in Wake shows the exact path for your install with a *Copy path* button, and one *Copy command* / *Copy config* button per client (*Show* reveals the snippet before you copy it). `wake-mcp setup` prints the same snippets from a terminal. Updating Wake keeps the path, so there is nothing to redo after an update.
+Settings → Connect in Wake shows the exact path for your install with a copy button next to it, and one copy button per client (*Show* reveals the snippet before you copy it). `wake-mcp setup` prints the same snippets from a terminal. Updating Wake keeps the path, so there is nothing to redo after an update.
 
 ## Setup
 
@@ -22,6 +22,16 @@ Settings → Connect in Wake shows the exact path for your install with a *Copy 
 claude mcp add --scope user wake -- "/Applications/Wake.app/Contents/MacOS/wake-mcp"
 ```
 
+Or install the Wake plugin instead, which adds this server and starts every new session
+knowing where your agents left off in the project (see
+[Claude Code plugin](cli.md#claude-code-plugin)):
+
+```bash
+claude plugin marketplace add iAmCorey/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake
+```
+
+Use one or the other, not both, or the tools are listed twice.
+
 ### Codex
 
 Add to `~/.codex/config.toml`:
@@ -30,6 +40,15 @@ Add to `~/.codex/config.toml`:
 [mcp_servers.wake]
 command = "/Applications/Wake.app/Contents/MacOS/wake-mcp"
 ```
+
+Or install the Wake plugin instead, which adds this server and starts every new session
+knowing where your agents left off in the project (see [Codex plugin](cli.md#codex-plugin)):
+
+```bash
+codex plugin marketplace add iAmCorey/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake
+```
+
+Use one or the other, not both, or the tools are listed twice.
 
 ### Cursor
 
@@ -85,9 +104,11 @@ Before asking me for context about this repository, check earlier sessions with 
 wake_list_sessions with the current directory, then wake_get_session for the relevant one.
 ```
 
-Claude Code can also be handed the project's recent sessions automatically when a session
-starts, through a `SessionStart` hook that runs `wake-cli` — see
-[Automatically, at session start](cli.md#teaching-an-agent-to-use-it) in the command-line guide.
+Claude Code and Codex can also be told where your agents left off in the project when a
+session starts — each recent session with its last question and reply — through a hook
+that runs `wake-cli context`; see
+[Claude Code plugin](cli.md#claude-code-plugin) and [Codex plugin](cli.md#codex-plugin) in the
+command-line guide. Both plugins bring this MCP server along.
 
 ### A worked example
 
@@ -109,7 +130,7 @@ Everything above happens locally; Wake itself does not change and the other agen
 
 - No write tools: nothing can delete, star, rename or resume a session. Resuming stays in Wake.
 - Subagent transcripts that live inside a session (Claude Code sidechains, Cursor subagents) are not merged into the main transcript: `wake_get_session` lists their ids at the end and reads one when it is passed as `subagent`. Sub-agents that their agent records as sessions of their own (Codex `spawn_agent`, Grok) are folded under their parent in `wake_list_sessions`; the parent's `wake_get_session` output lists them by key, and each reads like any other session.
-- Antigravity sessions are metadata only — their transcripts are encrypted on disk, so an agent gets the same preview card Wake shows.
+- Antigravity conversations with no plain-text transcript on disk (older versions store the body encrypted) are metadata only, so an agent gets the same preview card Wake shows.
 - Archived Codex sessions appear in search results but not in `wake_list_sessions` or `wake_list_projects`.
 - Codex's own background threads — the guardian auto-review, `/review`, compaction and memory consolidation that Codex writes into the same `sessions` directory — are not indexed at all: they never show up in search, lists or project counts, and there is no key to read them by. Threads started by `spawn_agent` are the exception: they are work the user asked for, so they are indexed under the session that spawned them, titled with the task name. The turns Codex copies from the parent when it forks a sub-agent are dropped, so the parent's own conversation is only indexed once. After upgrading, rows an older Wake had indexed disappear once Wake itself has rescanned (launch it, or press Refresh); `wake-mcp` only reads the index and never rescans.
 
@@ -131,8 +152,8 @@ All five tools are read-only and return Markdown text (`content[0].text`). Param
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `project` | string | Scope to one project. Pass an absolute path — the agent's working directory is ideal — or a project name. Path matching is three-tier: an exact match of an indexed project path; otherwise the longest indexed project that contains the path (you are in a subdirectory); otherwise every indexed project below the path (a monorepo root or a parent folder). A bare name matches the project name case-insensitively. When nothing matches, the reply lists the known projects instead of erroring. |
-| `agents` | string[] | Only these agents. Ids: `claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`, `codebuddy`, `workbuddy`, `zcode`, `craft-agents`, `devin`. Display names (`"Claude Code"`, `"Gemini CLI"`) and a few aliases (`claude`, `deepseek`, `opencode2`, `craft`) are accepted too. |
+| `project` | string | Scope to one project. Pass an absolute path — the agent's working directory is ideal — or a project name. Path matching is three-tier: an exact match of an indexed project path; otherwise the longest indexed project that contains the path (you are in a subdirectory) — your home folder and the filesystem root never count here, since sessions started there are not about the project you are in; otherwise every indexed project below the path (a monorepo root or a parent folder). A bare name matches the project name case-insensitively. When nothing matches, the reply lists the known projects instead of erroring. |
+| `agents` | string[] | Only these agents. Ids: `claude-code`, `codex`, `grok`, `dsh`, `cursor`, `opencode`, `pi`, `omp`, `kiro`, `kimi`, `gemini`, `copilot`, `antigravity`, `qoder`, `hermes`, `openclaw`, `codebuddy`, `workbuddy`, `zcode`, `craft-agents`, `devin`, `kilo`. Display names (`"Claude Code"`, `"Gemini CLI"`) and a few aliases (`claude`, `deepseek`, `opencode2`, `craft`) are accepted too. |
 | `since` | string | Only sessions updated at or after this time. Relative: `30m`, `24h`, `7d`, `2w`. Absolute: `2026-09-01`, `2026-09-01 09:30`, `2026-09-01T09:30:00Z`. Naive date-times are read in local time. |
 | `limit` | integer | Maximum items to return; values outside the allowed range are clamped. |
 

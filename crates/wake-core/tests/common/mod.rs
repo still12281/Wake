@@ -8,6 +8,55 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use wake_core::db::{IndexLock, Ownership};
+use wake_core::models::{AgentId, IndexUnit, Role, SessionMeta};
+
+/// 一条最小的会话元数据(Claude Code、无模型无 token);测试按需用 `..meta(..)` 改字段。
+/// SessionMeta 没有 Default,新字段只补这一处
+pub fn meta(key: &str, title: &str) -> SessionMeta {
+    SessionMeta {
+        host: String::new(),
+        key: key.to_string(),
+        id: key.split(':').nth(1).unwrap_or(key).to_string(),
+        agent: AgentId::ClaudeCode,
+        title: title.to_string(),
+        project_path: "/tmp/proj".into(),
+        project_name: "proj".into(),
+        file_path: format!("/tmp/fixtures/{key}.jsonl"),
+        created_at: 1_700_000_000_000,
+        updated_at: 1_700_000_100_000,
+        message_count: 2,
+        size_bytes: 128,
+        git_branch: None,
+        model: None,
+        tokens_used: None,
+        archived: false,
+        source: None,
+        favorite: false,
+        pinned: false,
+    }
+}
+
+/// 目录的真实路径,与子进程看到的工作目录同一种写法:macOS 的临时目录在符号链接后面
+/// (/var → /private/var),子进程的 cwd 是解开后的;Windows 的 canonicalize 会加 `\\?\`
+/// 前缀,子进程的 cwd 没有它——直接拿 canonicalize 的结果去比,Windows 上一条都对不上
+pub fn real_dir(path: &Path) -> PathBuf {
+    let real = fs::canonicalize(path).unwrap();
+    match real.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => real,
+    }
+}
+
+/// 一个索引单元(主线、时间戳随 seq 递增);IndexUnit 同样没有 Default
+pub fn unit(seq: i64, role: Role, text: &str) -> IndexUnit {
+    IndexUnit {
+        seq,
+        sidechain_id: None,
+        role,
+        timestamp: Some(1_700_000_000_000 + seq),
+        text: text.to_string(),
+    }
+}
 
 /// dsh 默认落盘的 zstd 多帧日志:首帧 header 行、次帧事件批,帧直接连接(写端每次 append
 /// 一帧,解码器解到 EOF)
@@ -251,6 +300,11 @@ pub struct Sidecars {
     pub cursor_ide_db: PathBuf,
     pub zcode_db: PathBuf,
     pub devin_db: PathBuf,
+    /// Kilo Code 新版的库
+    pub kilo_db: PathBuf,
+    /// Kilo Code 旧版扩展装在 VS Code / Cursor 里各自的任务目录
+    pub kilo_tasks: PathBuf,
+    pub kilo_cursor_tasks: PathBuf,
 }
 
 /// 侧档与 SQLite 型 fixture 库:copilot/opencode(两代)/antigravity 现建库,
@@ -359,6 +413,21 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
     fs::create_dir_all(devin_db.parent().unwrap()).expect("mkdir devin cli dir");
     build_devin_db(&devin_db);
 
+    let kilo_dir = home.join(".local").join("share").join("kilo");
+    fs::create_dir_all(&kilo_dir).expect("mkdir kilo data dir");
+    let kilo_db = kilo_dir.join("kilo.db");
+    build_kilo_db(&kilo_db);
+    // 旧版扩展:VS Code 里一份(带 globalState 的 taskHistory),Cursor 里一份
+    let code_storage = vscode_global_storage(home, "Code");
+    let kilo_tasks = code_storage.join("kilocode.kilo-code").join("tasks");
+    copy_tree(&fixture("kilo-legacy/Code/tasks"), &kilo_tasks);
+    build_kilo_global_state(
+        &code_storage.join("state.vscdb"),
+        r#"{"taskHistory":[{"id":"1736400000000","ts":1736400006000,"task":"旧标题(globalState)","workspace":"/Users/tester/Github/stale","tokensIn":10,"tokensOut":20}],"kilo-code.welcomed":true}"#,
+    );
+    let kilo_cursor_tasks = cursor_ide_dir.join("kilocode.kilo-code").join("tasks");
+    copy_tree(&fixture("kilo-legacy/Cursor/tasks"), &kilo_cursor_tasks);
+
     Sidecars {
         copilot_db,
         opencode_db,
@@ -370,12 +439,16 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
         cursor_ide_db,
         zcode_db,
         devin_db,
+        kilo_db,
+        kilo_tasks,
+        kilo_cursor_tasks,
     }
 }
 
-/// `<home>/…/Cursor/User/globalStorage`,与 adapters::cursor_ide::storage_dir
-/// 的平台分支逐条对应(改一处必须改另一处,契约测试会因路径不符而空列)
-pub fn cursor_ide_storage_dir(home: &Path) -> PathBuf {
+/// `<home>/…/<编辑器>/User/globalStorage`:VS Code 系编辑器的 globalStorage,与
+/// adapters::vscode_user_data 的平台分支逐条对应(改一处必须改另一处,契约测试会因路径
+/// 不符而空列)
+pub fn vscode_global_storage(home: &Path, editor: &str) -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         home.join("Library").join("Application Support")
     } else if cfg!(target_os = "windows") {
@@ -383,7 +456,175 @@ pub fn cursor_ide_storage_dir(home: &Path) -> PathBuf {
     } else {
         home.join(".config")
     };
-    base.join("Cursor").join("User").join("globalStorage")
+    base.join(editor).join("User").join("globalStorage")
+}
+
+/// `<home>/…/Cursor/User/globalStorage`
+pub fn cursor_ide_storage_dir(home: &Path) -> PathBuf {
+    vscode_global_storage(home, "Cursor")
+}
+
+/// 编辑器的 `globalStorage/state.vscdb`:扩展的 globalState 整份 JSON 存在 ItemTable 里、以
+/// 扩展 id 为 key(另放一条别家扩展的行和一条 secret 行陪着)
+fn build_kilo_global_state(path: &Path, global_state: &str) {
+    let conn = rusqlite::Connection::open(path).expect("create state.vscdb fixture");
+    conn.execute_batch(
+        r#"
+        CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+        INSERT INTO ItemTable VALUES ('GitHub.copilot', '{"seen":true}');
+        INSERT INTO ItemTable VALUES ('secret://{"extensionId":"kilocode.kilo-code","key":"apiKey"}', X'00FF');
+        "#,
+    )
+    .expect("populate state.vscdb fixture");
+    conn.execute(
+        "INSERT INTO ItemTable VALUES ('kilocode.kilo-code', ?1)",
+        [global_state],
+    )
+    .expect("insert kilo globalState");
+}
+
+/// Kilo Code 新版的 `kilo.db`(OpenCode 分支,表与 OpenCode 同形,列按 Kilo 7.x 的真实
+/// schema 取子集):
+/// - `ses_kilo_0001`:正常会话,v1 两表;另有一条实验开关下双写的 session_message
+///   shell 记录——必须照旧读 message + part(OpenCode 的判据会只剩那一条);part 里带
+///   agent / retry 两种已知但不渲染的类型
+/// - `ses_kilo_0002`:用户敲 `/review` 派子代理(消息里只有 subtask 块)、一条 compaction
+///   标记、压缩出的摘要
+/// - `ses_kilo_0003`:子代理会话(parent_id),不列
+/// - `ses_kilo_0004`:已归档
+/// - `ses_kilo_0005`:只有 session_message 的会话(v2 路径)
+/// - `ses_kilo_0006`:没有正文,不列
+/// - 旧任务 `migrated-task-0004` 导进来的那份(`ses_migrated_…`),与旧版任务目录里的
+///   原件同 key,scanner 让这份胜出
+///
+/// 另有 credential 表与一行假凭证:真库就长这样,adapter 绝不读它
+pub fn build_kilo_db(path: &Path) {
+    let migrated = wake_core::adapters::kilo::migrated_session_id("migrated-task-0004");
+    let conn = rusqlite::Connection::open(path).expect("create kilo fixture db");
+    conn.execute_batch(&format!(
+        r#"
+        CREATE TABLE session (
+            id TEXT PRIMARY KEY, project_id TEXT NOT NULL, workspace_id TEXT, parent_id TEXT,
+            slug TEXT NOT NULL, directory TEXT NOT NULL, path TEXT, title TEXT NOT NULL,
+            version TEXT NOT NULL, share_url TEXT, metadata TEXT,
+            cost REAL NOT NULL DEFAULT 0,
+            tokens_input INTEGER NOT NULL DEFAULT 0, tokens_output INTEGER NOT NULL DEFAULT 0,
+            tokens_reasoning INTEGER NOT NULL DEFAULT 0, tokens_cache_read INTEGER NOT NULL DEFAULT 0,
+            tokens_cache_write INTEGER NOT NULL DEFAULT 0, agent TEXT, model TEXT,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+            time_compacting INTEGER, time_archived INTEGER
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE credential (
+            id TEXT PRIMARY KEY, integration_id TEXT, label TEXT NOT NULL, value TEXT NOT NULL,
+            connector_id TEXT, method_id TEXT, active INTEGER,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL
+        );
+        INSERT INTO credential VALUES
+            ('cred-1', 'kilo', 'default', '{{"type":"api","key":"NOT-A-REAL-SECRET"}}', NULL, NULL, 1, 0, 0);
+
+        INSERT INTO session (id, project_id, parent_id, slug, directory, title, version,
+                             tokens_input, tokens_output, tokens_reasoning, agent, model,
+                             time_created, time_updated, time_archived) VALUES
+            ('ses_kilo_0001', 'prj1', NULL, 'brave-otter', '/Users/tester/Github/wakefx',
+             'Kilo 二维码泄漏排查', '7.8.8', 100, 40, 10, 'code',
+             '{{"id":"kilo-auto/free","providerID":"kilo"}}', 1786300000000, 1786300600000, NULL),
+            ('ses_kilo_0002', 'prj1', NULL, 'calm-pine', '/Users/tester/Github/wakefx',
+             'Review the QR changes', '7.8.8', 0, 0, 0, 'code', NULL,
+             1786301000000, 1786301600000, NULL),
+            ('ses_kilo_0003', 'prj1', 'ses_kilo_0001', 'sub-agent', '/Users/tester/Github/wakefx',
+             'Subagent: grep the scanner', '7.8.8', 0, 0, 0, 'explore', NULL,
+             1786300200000, 1786300300000, NULL),
+            ('ses_kilo_0004', 'prj1', NULL, 'old-lake', '/Users/tester/Github/wakefx',
+             'Archived Kilo session', '7.8.8', 0, 0, 0, 'code', NULL,
+             1786200000000, 1786200100000, 1786400000000),
+            ('ses_kilo_0005', 'prj1', NULL, 'next-wave', '/Users/tester/Github/wakefx',
+             'Kilo v2 会话', '7.9.0', 0, 0, 0, 'code', NULL,
+             1786500000000, 1786500100000, NULL),
+            ('ses_kilo_0006', 'prj1', NULL, 'empty-sky', '/Users/tester/Github/wakefx',
+             'New session', '7.8.8', 0, 0, 0, 'code', NULL,
+             1786600000000, 1786600000000, NULL),
+            ('{migrated}', 'prj1', NULL, 'migrated-task-0004', '/Users/tester/Github/wakefx',
+             '迁移过的旧任务', 'v2', 0, 0, 0, NULL, NULL,
+             1736600001000, 1736600002000, NULL);
+
+        INSERT INTO message VALUES
+            ('msg_k1_a', 'ses_kilo_0001', 1786300050000, 1786300050000,
+             '{{"role":"user","time":{{"created":1786300050000}},"agent":"code"}}'),
+            ('msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"role":"assistant","time":{{"created":1786300100000}},"modelID":"kilo-auto/free","providerID":"kilo"}}'),
+            ('msg_k2_a', 'ses_kilo_0002', 1786301050000, 1786301050000,
+             '{{"role":"user","time":{{"created":1786301050000}}}}'),
+            ('msg_k2_b', 'ses_kilo_0002', 1786301100000, 1786301100000,
+             '{{"role":"assistant","time":{{"created":1786301100000}}}}'),
+            ('msg_k2_c', 'ses_kilo_0002', 1786301200000, 1786301200000,
+             '{{"role":"user","time":{{"created":1786301200000}}}}'),
+            ('msg_k2_d', 'ses_kilo_0002', 1786301300000, 1786301300000,
+             '{{"role":"assistant","summary":true,"time":{{"created":1786301300000}}}}'),
+            ('msg_k3_a', 'ses_kilo_0003', 1786300250000, 1786300250000,
+             '{{"role":"user","time":{{"created":1786300250000}}}}'),
+            ('msg_k4_a', 'ses_kilo_0004', 1786200050000, 1786200050000,
+             '{{"role":"user","time":{{"created":1786200050000}}}}'),
+            ('msg_m4_a', '{migrated}', 1736600001000, 1736600001000,
+             '{{"role":"user","time":{{"created":1736600001000}}}}'),
+            ('msg_m4_b', '{migrated}', 1736600002000, 1736600002000,
+             '{{"role":"assistant","time":{{"created":1736600002000}}}}');
+
+        INSERT INTO part VALUES
+            ('prt_k1_a1', 'msg_k1_a', 'ses_kilo_0001', 1786300050000, 1786300050000,
+             '{{"type":"text","text":"Kilo 修一下二维码扫描的 useEffect() 泄漏 @build"}}'),
+            ('prt_k1_a2', 'msg_k1_a', 'ses_kilo_0001', 1786300050000, 1786300050000,
+             '{{"type":"agent","name":"build"}}'),
+            ('prt_k1_b1', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"step-start"}}'),
+            ('prt_k1_b2', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"reasoning","text":"先看清理函数"}}'),
+            ('prt_k1_b3', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"retry","attempt":1,"error":{{"name":"APIError","data":{{"message":"overloaded"}}}},"time":{{"created":1786300100500}}}}'),
+            ('prt_k1_b4', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"tool","callID":"call_1","tool":"grep","state":{{"status":"completed","input":{{"pattern":"useEffect"}},"output":"src/QrScanner.tsx:42"}}}}'),
+            ('prt_k1_b5', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"text","text":"找到了:卸载时没有停止扫描。"}}'),
+            ('prt_k1_b6', 'msg_k1_b', 'ses_kilo_0001', 1786300100000, 1786300100000,
+             '{{"type":"step-finish","tokens":{{"input":100,"output":40}}}}'),
+            ('prt_k2_a1', 'msg_k2_a', 'ses_kilo_0002', 1786301050000, 1786301050000,
+             '{{"type":"subtask","command":"review","description":"Review the QR changes","agent":"reviewer","prompt":"Review the following changes carefully"}}'),
+            ('prt_k2_b1', 'msg_k2_b', 'ses_kilo_0002', 1786301100000, 1786301100000,
+             '{{"type":"text","text":"Review done: no leaks left."}}'),
+            ('prt_k2_c1', 'msg_k2_c', 'ses_kilo_0002', 1786301200000, 1786301200000,
+             '{{"type":"compaction","auto":true}}'),
+            ('prt_k2_d1', 'msg_k2_d', 'ses_kilo_0002', 1786301300000, 1786301300000,
+             '{{"type":"text","text":"Summary of the QR work so far."}}'),
+            ('prt_k3_a1', 'msg_k3_a', 'ses_kilo_0003', 1786300250000, 1786300250000,
+             '{{"type":"text","text":"grep the scanner"}}'),
+            ('prt_k4_a1', 'msg_k4_a', 'ses_kilo_0004', 1786200050000, 1786200050000,
+             '{{"type":"text","text":"an archived question"}}'),
+            ('prt_m4_a1', 'msg_m4_a', '{migrated}', 1736600001000, 1736600001000,
+             '{{"type":"text","text":"迁移过的旧任务"}}'),
+            ('prt_m4_b1', 'msg_m4_b', '{migrated}', 1736600002000, 1736600002000,
+             '{{"type":"text","text":"旧任务的回答(导入后)"}}');
+
+        INSERT INTO session_message VALUES
+            ('sm_k1_0', 'ses_kilo_0001', 'shell', 0, 1786300400000, 1786300400000,
+             '{{"callID":"sh-1","command":"pnpm test","output":"ok","time":{{"created":1786300400000}}}}'),
+            ('sm_k5_0', 'ses_kilo_0005', 'user', 0, 1786500000000, 1786500000000,
+             '{{"text":"Kilo v2 会话问一句","time":{{"created":1786500000000}}}}'),
+            ('sm_k5_1', 'ses_kilo_0005', 'assistant', 1, 1786500050000, 1786500050000,
+             '{{"model":{{"id":"kilo-auto/free","providerID":"kilo"}},"time":{{"created":1786500050000}},"content":[{{"type":"text","text":"v2 回答"}}]}}');
+        "#
+    ))
+    .expect("populate kilo fixture db");
 }
 
 /// Hermes `state.db` 最小同构库:sessions + messages(时间戳 unix 秒 REAL)。
@@ -638,21 +879,27 @@ pub fn build_opencode_next_db(path: &Path) {
     .expect("populate opencode next fixture db");
 }
 
-/// Antigravity `conversation_summaries.db` 最小同构库:标题在 preview 列
-/// (title 列常空);ag-0002 是子会话(parent 非空),必须被过滤。
+/// Antigravity 会话索引表,老库形态(新版多一列 `app_data_dir`,见 `build_antigravity_index`)
+const ANTIGRAVITY_INDEX_TABLE: &str = r#"
+    CREATE TABLE conversation_summaries (
+        conversation_id text, title text NOT NULL DEFAULT "",
+        preview text NOT NULL DEFAULT "", step_count integer NOT NULL DEFAULT 0,
+        last_modified_time datetime NOT NULL, workspace_uris text NOT NULL,
+        parent_conversation_id text NOT NULL DEFAULT "",
+        nesting_depth integer NOT NULL DEFAULT 0,
+        last_user_input_time datetime NOT NULL,
+        PRIMARY KEY (conversation_id)
+    );
+"#;
+
+/// Antigravity `conversation_summaries.db` 最小同构库(老库,没有 `app_data_dir`):标题在
+/// preview 列(title 列常空);ag-0002 是子会话(parent 非空),必须被过滤。
 pub fn build_antigravity_db(path: &Path) {
     let conn = rusqlite::Connection::open(path).expect("create antigravity fixture db");
+    conn.execute_batch(ANTIGRAVITY_INDEX_TABLE)
+        .expect("create antigravity fixture table");
     conn.execute_batch(
         r#"
-        CREATE TABLE conversation_summaries (
-            conversation_id text, title text NOT NULL DEFAULT "",
-            preview text NOT NULL DEFAULT "", step_count integer NOT NULL DEFAULT 0,
-            last_modified_time datetime NOT NULL, workspace_uris text NOT NULL,
-            parent_conversation_id text NOT NULL DEFAULT "",
-            nesting_depth integer NOT NULL DEFAULT 0,
-            last_user_input_time datetime NOT NULL,
-            PRIMARY KEY (conversation_id)
-        );
         INSERT INTO conversation_summaries
             (conversation_id, title, preview, step_count, last_modified_time,
              workspace_uris, parent_conversation_id, nesting_depth, last_user_input_time)
@@ -664,6 +911,73 @@ pub fn build_antigravity_db(path: &Path) {
         "#,
     )
     .expect("populate antigravity fixture db");
+}
+
+/// 新版 Antigravity 会话索引里的一行(`build_antigravity_index` 用)
+#[derive(Clone, Copy, Default)]
+pub struct AgIndexRow {
+    pub id: &'static str,
+    pub preview: &'static str,
+    pub workspace: &'static str,
+    /// 父会话 id;非空 = 子会话,同时记 nesting_depth = 1
+    pub parent: &'static str,
+    /// 会话所在的 app 数据目录名(`antigravity` / `antigravity-ide`)
+    pub app: &'static str,
+}
+
+/// 新版的会话索引(多一列 `app_data_dir`)建在 `<gemini>/antigravity-cli/` 下,返回库路径
+pub fn build_antigravity_index(gemini: &Path, rows: &[AgIndexRow]) -> PathBuf {
+    let dir = gemini.join("antigravity-cli");
+    fs::create_dir_all(&dir).expect("mkdir antigravity-cli");
+    let path = dir.join("conversation_summaries.db");
+    let conn = rusqlite::Connection::open(&path).expect("create antigravity index");
+    conn.execute_batch(ANTIGRAVITY_INDEX_TABLE)
+        .expect("create antigravity index table");
+    conn.execute_batch(
+        r#"ALTER TABLE conversation_summaries ADD COLUMN app_data_dir text NOT NULL DEFAULT """#,
+    )
+    .expect("add app_data_dir");
+    for row in rows {
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, preview, step_count,
+                 last_modified_time, workspace_uris, parent_conversation_id, nesting_depth,
+                 last_user_input_time, app_data_dir)
+             VALUES (?1, ?2, 4, '2026-08-30 02:12:05.000000+00:00', ?3, ?4, ?5,
+                     '2026-08-30 02:12:00.000000+00:00', ?6)",
+            rusqlite::params![
+                row.id,
+                row.preview,
+                format!("[\"file://{}\"]", row.workspace),
+                row.parent,
+                i64::from(!row.parent.is_empty()),
+                row.app
+            ],
+        )
+        .expect("insert antigravity index row");
+    }
+    path
+}
+
+/// 一条 Antigravity brain 转录(合成 fixture,格式见 PR #52)+ 若干用户贴图
+/// (`.user_uploaded/media_<毫秒>.png`),返回转录路径
+pub fn stage_antigravity_transcript(brain: &Path, id: &str, uploads: &[i64]) -> PathBuf {
+    let session = brain.join(id);
+    let logs = session.join(".system_generated").join("logs");
+    fs::create_dir_all(&logs).expect("mkdir antigravity transcript dir");
+    let transcript = logs.join("transcript.jsonl");
+    fs::copy(fixture("antigravity/transcript.jsonl"), &transcript).expect("copy transcript");
+    if !uploads.is_empty() {
+        let dir = session.join(".user_uploaded");
+        fs::create_dir_all(&dir).expect("mkdir .user_uploaded");
+        for ms in uploads {
+            fs::write(
+                dir.join(format!("media_{ms}.png")),
+                b"\x89PNG\r\n\x1a\nfixture",
+            )
+            .expect("write upload");
+        }
+    }
+    transcript
 }
 
 /// Cursor IDE `state.vscdb` 最小同构库:VS Code 的两张 KV 表 + 2026 新增的
@@ -826,6 +1140,10 @@ pub fn clear_agent_env_overrides() {
         "CODEBUDDY_CONFIG_DIR",
         "WORKBUDDY_CONFIG_DIR",
         "ZCODE_STORAGE_DIR",
+        "KIMI_CODE_HOME",
+        // 库路径的覆盖:指向现存文件时会被加进数据根,读到合成 HOME 之外的真实库
+        "OPENCODE_DB",
+        "KILO_DB",
     ] {
         std::env::remove_var(var);
     }
@@ -989,4 +1307,120 @@ pub fn lock_as(db: &Path, kind: &str) -> IndexLock {
             Ownership::Held(who) => panic!("a fresh lock should not be held by {who}"),
         }
     }
+}
+
+/// Claude Code 的分支会话:原件 A 问了两轮;B 是从 A 第一轮之后分出来的——Claude 把 A 到
+/// 分叉点为止的行**原样**复制进 B 的开头(uuid、message.id、时间戳都不变,只改 sessionId),
+/// 头几行(custom-title 照抄 A 的标题、queue-operation)是复制那一刻写的,时间晚于 A 的开头。
+/// 之后 B 问了自己的一轮。返回 (项目目录, A 的 id, B 的 id)。adapter_contracts 与
+/// scanner_finale 共用
+pub fn stage_claude_branch(projects: &Path) -> (PathBuf, String, String) {
+    let dir = projects.join("-Users-tester-Github-branchfx");
+    fs::create_dir_all(&dir).unwrap();
+    let a = "c1a0de00-0000-4000-8000-0000000000a1".to_string();
+    let b = "c1a0de00-0000-4000-8000-0000000000b2".to_string();
+    let row = |session: &str,
+               typ: &str,
+               uuid: &str,
+               parent: Option<&str>,
+               ts: &str,
+               message: serde_json::Value| {
+        serde_json::json!({
+            "parentUuid": parent,
+            "isSidechain": false,
+            "cwd": "/Users/tester/Github/branchfx",
+            "sessionId": session,
+            "type": typ,
+            "message": message,
+            "uuid": uuid,
+            "timestamp": ts,
+        })
+    };
+    let user = |text: &str| serde_json::json!({ "role": "user", "content": text });
+    let reply = |id: &str, text: &str, input: i64, output: i64| {
+        serde_json::json!({
+            "id": id,
+            "role": "assistant",
+            "model": "claude-opus-5-5",
+            "content": [{ "type": "text", "text": text }],
+            "usage": { "input_tokens": input, "output_tokens": output },
+        })
+    };
+    let header = |session: &str, ts: &str| {
+        vec![
+            serde_json::json!({ "type": "custom-title", "customTitle": "修复登录超时", "sessionId": session }),
+            serde_json::json!({ "type": "queue-operation", "operation": "enqueue", "timestamp": ts, "sessionId": session }),
+        ]
+    };
+    // 两份共有的第一轮:B 里的是原样复制(只有 sessionId 不同)
+    let shared = |session: &str| {
+        vec![
+            row(
+                session,
+                "user",
+                "c1a0de00-1111-4000-8000-000000000001",
+                None,
+                "2026-09-01T08:00:01.000Z",
+                user("登录接口偶发超时,先看看日志"),
+            ),
+            row(
+                session,
+                "assistant",
+                "c1a0de00-1111-4000-8000-000000000002",
+                Some("c1a0de00-1111-4000-8000-000000000001"),
+                "2026-09-01T08:00:05.000Z",
+                reply(
+                    "msg_shared_01",
+                    "日志里连接池耗尽了,把上限从 10 调到 50。",
+                    100,
+                    20,
+                ),
+            ),
+        ]
+    };
+    let mut lines_a = header(&a, "2026-09-01T08:00:00.000Z");
+    lines_a.extend(shared(&a));
+    lines_a.push(row(
+        &a,
+        "user",
+        "c1a0de00-1111-4000-8000-000000000003",
+        Some("c1a0de00-1111-4000-8000-000000000002"),
+        "2026-09-01T08:10:00.000Z",
+        user("调了,还是超时"),
+    ));
+    lines_a.push(row(
+        &a,
+        "assistant",
+        "c1a0de00-1111-4000-8000-000000000004",
+        Some("c1a0de00-1111-4000-8000-000000000003"),
+        "2026-09-01T08:10:05.000Z",
+        reply("msg_a_02", "那再加个指数退避的重试。", 200, 30),
+    ));
+
+    let mut lines_b = header(&b, "2026-09-02T09:00:00.000Z");
+    lines_b.extend(shared(&b));
+    lines_b.push(row(
+        &b,
+        "user",
+        "c1a0de00-2222-4000-8000-000000000003",
+        Some("c1a0de00-1111-4000-8000-000000000002"),
+        "2026-09-02T09:00:10.000Z",
+        user("换个思路:登录改成异步队列"),
+    ));
+    lines_b.push(row(
+        &b,
+        "assistant",
+        "c1a0de00-2222-4000-8000-000000000004",
+        Some("c1a0de00-2222-4000-8000-000000000003"),
+        "2026-09-02T09:00:15.000Z",
+        reply("msg_b_02", "好,登录请求进后台队列,前端轮询结果。", 300, 40),
+    ));
+
+    let write = |id: &str, lines: &[serde_json::Value]| {
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(dir.join(format!("{id}.jsonl")), text).unwrap();
+    };
+    write(&a, &lines_a);
+    write(&b, &lines_b);
+    (dir, a, b)
 }
