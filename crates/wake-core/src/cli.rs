@@ -114,6 +114,11 @@ const PLAIN: &[PlainSpec] = &[
         action: Action::Refresh,
         summary: "update an existing index while Wake is closed",
     },
+    PlainSpec {
+        name: "context",
+        action: Action::Context,
+        summary: "where your agents left off in this folder's project — for a session-start hook; prints nothing when there are none",
+    },
 ];
 
 const F_PROJECT: FlagSpec = FlagSpec::new(
@@ -266,6 +271,9 @@ pub enum Action {
     Index,
     /// 增量刷一轮已有的索引。**只在 Wake 没运行时**——它在跑就退让
     Refresh,
+    /// 当前目录所在项目最近的会话,给 SessionStart 钩子(`tools::session_start_context`);
+    /// 没有就一个字都不写
+    Context,
     /// 一次工具调用。`args` **恒为 JSON object**——mcp/mod.rs 那道
     /// `arguments` 形状检查在这条路上不可达,别再补一遍
     Tool {
@@ -785,6 +793,44 @@ project on the machine is in scope. Everything is read-only.";
 /// 与 `wake-cli setup` 同一个来源
 pub const SKILL_INSTALL: &str = "npx skills add iAmCorey/Wake";
 
+/// 两家插件的安装命令,Settings → Connect、`wake-cli setup` 与文档同一个来源(tests/cli.rs 卡
+/// 文档里的写法)。插件都在 `plugins/wake/`,Claude Code 的市场是仓库根的
+/// `.claude-plugin/marketplace.json`,Codex 的是 `.agents/plugins/marketplace.json`。`--sparse`
+/// 只检出市场文件与插件目录:不加的话两家都把整个仓库克隆下来(约 6 MB、还随官网素材长),只为
+/// 读几 KB 的插件文件,Codex 每次升级市场还会重来一遍
+pub const CLAUDE_PLUGIN_INSTALL: &str = "claude plugin marketplace add iAmCorey/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake";
+/// 见 `CLAUDE_PLUGIN_INSTALL`
+pub const CODEX_PLUGIN_INSTALL: &str = "codex plugin marketplace add iAmCorey/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake";
+
+/// 这个平台给不给两家插件(Claude Code plugin / Codex plugin)。Windows 上不给:插件的脚本是 sh。
+/// 判断只在这里——设置页与 `wake-cli setup` 各自问它;片段函数本身不分平台,i18n 的死条目检查
+/// 在 Windows 上也得看得见这两句用法(片段给 None 时 Windows CI 必红,2026-10-09 Codex review)
+pub const AGENT_PLUGINS: bool = !cfg!(target_os = "windows");
+
+/// 让每个新会话一开场就知道各个 agent 停在哪(`wake-cli context`)、顺带装上 Wake 的 MCP 工具
+/// 的两家插件,各用各家的正名(用户 2026-10-09 定:不自己起名字)。Settings → Connect 的两块与
+/// `wake-cli setup` 同源,给不给看 `AGENT_PLUGINS`
+pub fn claude_plugin_snippet() -> crate::mcp::SetupSnippet {
+    crate::mcp::SetupSnippet {
+        client: "Claude Code",
+        agent: AgentId::ClaudeCode,
+        hint: "Run in a terminal to install the Wake plugin",
+        copy_label: "Copy command",
+        text: CLAUDE_PLUGIN_INSTALL.to_string(),
+    }
+}
+
+/// 见 `claude_plugin_snippet`。Codex 只在用户信任过插件的钩子之后才跑它,一句用法里交代清楚
+pub fn codex_plugin_snippet() -> crate::mcp::SetupSnippet {
+    crate::mcp::SetupSnippet {
+        client: "Codex",
+        agent: AgentId::Codex,
+        hint: "Run in a terminal, then trust its hook in Codex's /hooks",
+        copy_label: "Copy command",
+        text: CODEX_PLUGIN_INSTALL.to_string(),
+    }
+}
+
 /// 把 CLI 放进 PATH 的那一条**可粘命令**,给 GUI 的 Copy 按钮用。与
 /// `wake-cli setup` 打印的是同一个来源。返回 None 的两种情况都不该给按钮:
 /// 已经装在 `…/bin` 里(deb / tar)、以及 Windows——那边 path_hint 给的是
@@ -847,6 +893,11 @@ fn path_hint(bin: &Path) -> Option<String> {
     })
 }
 
+/// `wake-cli setup` 里一段可复制的配置:`## {标题} — {怎么用这段}`、片段、一句说明
+fn snippet_section(title: &str, s: &crate::mcp::SetupSnippet, note: &str) -> String {
+    format!("\n## {title} — {}\n\n{}\n\n{note}\n", s.hint, s.text)
+}
+
 /// `## {标题} — {怎么用这段}` 与 `wake-mcp setup` 同形,两个 bin 的输出读起来
 /// 才是一家人
 pub fn setup_text(f: &SetupFacts<'_>) -> String {
@@ -869,6 +920,19 @@ pub fn setup_text(f: &SetupFacts<'_>) -> String {
          project. Manual install: copy `skills/wake/` from the repository into\n\
          `~/.claude/skills/wake/`.\n"
     ));
+    if AGENT_PLUGINS {
+        for s in [claude_plugin_snippet(), codex_plugin_snippet()] {
+            out.push_str(&snippet_section(
+                &format!("{} plugin", s.client),
+                &s,
+                &format!(
+                    "Every new {0} session starts knowing where your agents left off in this\n\
+                     project, and {0} gets Wake's MCP tools to read those sessions.",
+                    s.client
+                ),
+            ));
+        }
+    }
     // 片段按 agent 认,不按下标——那个顺序是 Connect 页的事;hint 也用它自己
     // 带的,两个 bin 的 setup 输出才真的同形
     if let Some(snippet) = f.mcp_bin.and_then(|mcp| {
@@ -876,10 +940,10 @@ pub fn setup_text(f: &SetupFacts<'_>) -> String {
             .into_iter()
             .find(|s| s.agent == AgentId::ClaudeCode)
     }) {
-        out.push_str(&format!(
-            "\n## Tool-calling clients: prefer MCP — {}\n\n{}\n\n\
-             `wake-mcp setup` prints the same for Codex and Cursor.\n",
-            snippet.hint, snippet.text
+        out.push_str(&snippet_section(
+            "Tool-calling clients: prefer MCP",
+            &snippet,
+            "`wake-mcp setup` prints the same for Codex and Cursor.",
         ));
     }
     out.push_str("\nFull reference: docs/cli.md\n");
@@ -1197,6 +1261,7 @@ mod tests {
         assert_eq!(p(&["setup"]).unwrap().action, Action::Setup);
         assert_eq!(p(&["index"]).unwrap().action, Action::Index);
         assert_eq!(p(&["refresh"]).unwrap().action, Action::Refresh);
+        assert_eq!(p(&["context"]).unwrap().action, Action::Context);
         assert!(USAGE.lines().count() < 15, "USAGE 不该长回参考手册");
         assert!(!USAGE.ends_with('\n'));
     }
@@ -1353,6 +1418,9 @@ mod tests {
         assert!(t.contains(SKILL_INSTALL), "{t}");
         assert!(t.contains("~/.claude/skills/wake/"), "{t}");
         assert!(t.contains("claude mcp add"));
+        // 两家插件跟着平台走(Windows 上不给),判断只在 AGENT_PLUGINS
+        assert_eq!(t.contains("## Claude Code plugin"), AGENT_PLUGINS, "{t}");
+        assert_eq!(t.contains("## Codex plugin"), AGENT_PLUGINS, "{t}");
 
         let t = setup_text(&SetupFacts {
             cli_bin: &cli_bin,

@@ -11,6 +11,7 @@ pub mod dsh;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;
+pub mod kilo;
 pub mod kimi;
 pub mod kiro;
 pub mod openclaw;
@@ -52,13 +53,24 @@ pub trait AgentAdapter: Send + Sync {
     }
     /// 枚举全部会话文件。契约是"枚举必须廉价、绝不做全量解析":多数家纯 stat,
     /// SQLite 型跑元数据查询,dsh 读有界首行(子代理标志只存在于文件头)。
-    /// 故障就地降级为空列表,不外溢炸掉整轮扫描。
+    /// 根不在就是确定没有,降级为 Ok(空);Err 只表示"这一刻读不出"(库在却打不开)——
+    /// scanner 冻结这一家这一轮(库里归它的行原样留着),别家照常。
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>>;
-    /// watcher 事件路径 → 本 adapter 的会话文件引用;None = 非会话文件
-    /// (边车、子代理转录等)。默认:非空 .jsonl,stem 即 native_id。
+    /// watcher 事件路径 → 本 adapter 的会话文件引用;None = 与会话无关(子代理转录等)。
+    /// 解析时还要读的边车可以换成它所属会话的引用(Kimi 的 state.json):引用的 mtime / size
+    /// 要盖住解析读到的每个文件,只改了边车,全量扫描才判得出脏(Kilo legacy、Antigravity
+    /// 把索引那一行算进来是同一个道理)。默认:非空 .jsonl,stem 即 native_id。
     /// 各家的路径布局知识收敛在此,watcher 不再硬编码任何 agent 特例。
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
         parse_utils::default_file_ref(self.agent(), path)
+    }
+    /// 这份会话文件出现或消失时,还有哪些文件的引用(`file_ref` 的 mtime / size)跟着变——那些
+    /// 文件没动,watcher 收不到它们的事件。默认没有;Claude 分支的引用数着同目录更早的同根
+    /// 文件,原件被删、被放回,同目录的分支要重解析(展开 / 折叠复制来的历史)。watcher 对新
+    /// 出现与消失的路径各问一次,只把引用真变了的交给增量收编;全量扫描本来就逐个重比引用,
+    /// 用不着它。远程装饰器必须转发
+    fn ref_dependents(&self, _path: &Path) -> Vec<std::path::PathBuf> {
+        Vec::new()
     }
     /// 快路径:不解析文件直接给出 meta(Codex 走 state DB)。None = 无快路径
     fn quick_meta(
@@ -169,7 +181,7 @@ pub trait AgentAdapter: Send + Sync {
     /// 拥有本家 session 文件的位置",凭据/配置/索引这类不产生会话的文件不列。
     /// 新增 adapter 必须实现:没有默认值,漏了编译就过不去
     fn data_roots(&self) -> Vec<std::path::PathBuf>;
-    /// 文件监听根目录。默认 = data_roots 中现存的目录,二十一家实测全部吻合:
+    /// 文件监听根目录。默认 = data_roots 中现存的目录,二十二家实测全部吻合:
     /// 目录型给出自己的 root,SQLite 型的根是库文件、天然筛空(watcher 只认
     /// .jsonl,库变更靠启动/手动刷新),codex 的 sessions + archived 一并覆盖。
     /// 只有当监听范围确实不同于数据根时才覆写——否则一次根路径搬迁
@@ -188,6 +200,12 @@ pub trait AgentAdapter: Send + Sync {
     /// 侧档(gemini projects.json / kimi session_index / codex state DB)必须
     /// 全部相对 `dir` 派生,落回默认家目录就会拿错树。新增 adapter 必须实现。
     fn with_custom_root(&self, dir: std::path::PathBuf) -> Box<dyn AgentAdapter>;
+    /// 一家多源时,自定义 location(与远程挂载点)交给哪个实例构造:认领它的实例来,
+    /// 都不认领就交同家第一个实例(`custom_root_template`)。按路径**形状**判——远程挂载点
+    /// 在同步落盘前就要定形,别依赖存在性。默认不认领;Kilo 的旧版实例认领扩展的任务目录
+    fn claims_custom_root(&self, _dir: &std::path::Path) -> bool {
+        false
+    }
     /// 是否允许 Session locations 单独压制某条默认数据根。多数 adapter 的多个
     /// 根共同组成一个不可拆 location；OpenCode 的 stable/next 库则彼此独立。
     fn supports_individual_root_removal(&self) -> bool {
@@ -220,6 +238,13 @@ pub trait AgentAdapter: Send + Sync {
     /// 胜出文件"——落选的旧副本里过期的关系不采纳,parent 归别的 location 时边也不丢。
     /// 远程装饰器必须转发
     fn parent_links_in_child(&self) -> bool {
+        false
+    }
+    /// 本家的子会话是不是**分支**——从父会话分出去、自己完整的一段对话(Claude Code 的
+    /// fork),而不是父会话的一部分(子代理、子任务)。是的话删父会话不带上它们:详情页
+    /// 删除只删父会话本身,Clean Up 里分支自成一棵清理树;父会话没了,分支变回顶层会话、
+    /// 露出完整历史。默认 false(随父会话一起删)。远程装饰器必须转发
+    fn children_outlive_parent(&self) -> bool {
         false
     }
     /// 本家会话在**别家**目录里的替身。外壳产品(Craft Agents)跑的是别家的引擎,
@@ -268,9 +293,42 @@ pub(crate) fn env_dir(key: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// VS Code 系编辑器的用户数据目录(`<数据根>/<编辑器>`,下面是 `User/globalStorage`):
+/// macOS 在 `~/Library/Application Support`,Windows 在 `%APPDATA%`,Linux 在
+/// `$XDG_CONFIG_HOME`(缺省 `~/.config`)。只做路径推导、不探存在性。全从 `home_dir()`
+/// 派生——`dirs::config_dir()` 在 Windows 上走 SHGetKnownFolderPath,WAKE_HOME 改道对它
+/// 无效。Cursor IDE 的 state.vscdb 与 Kilo 旧版扩展的任务目录共用
+pub(crate) fn vscode_user_data(editor: &str) -> std::path::PathBuf {
+    let home = home_dir().unwrap_or_default();
+    let base = if cfg!(target_os = "macos") {
+        home.join("Library").join("Application Support")
+    } else if cfg!(target_os = "windows") {
+        home.join("AppData").join("Roaming")
+    } else {
+        env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"))
+    };
+    base.join(editor)
+}
+
+/// 自定义 location / 远程挂载点 `dir` 交给同家哪个实例构造(见 `claims_custom_root`)
+pub(crate) fn custom_root_template<'a>(
+    base: &'a [Box<dyn AgentAdapter>],
+    agent: AgentId,
+    dir: &Path,
+) -> Option<&'a dyn AgentAdapter> {
+    let same = || {
+        base.iter()
+            .map(|a| a.as_ref())
+            .filter(move |a| a.agent() == agent)
+    };
+    same()
+        .find(|a| a.claims_custom_root(dir))
+        .or_else(|| same().next())
+}
+
 /// 各家数据根共用的 HOME。**全部 adapter 必须走这里**,不要直接
 /// `dirs::home_dir()`——`WAKE_HOME` 是整组 adapter 的统一改道开关:
-/// 契约测试靠它把二十一家指向 fixture 目录,而 `dirs::home_dir()` 只在
+/// 契约测试靠它把二十二家指向 fixture 目录,而 `dirs::home_dir()` 只在
 /// POSIX 上看 `$HOME`,Windows 上走 SHGetKnownFolderPath、无论如何都指向
 /// 真实用户目录(于是 Windows 上的契约测试全部落空,2026-08-25 review)。
 /// 对用户它顺带是便携安装/多档案切换的手动开关。
@@ -278,10 +336,10 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     env_dir("WAKE_HOME").or_else(dirs::home_dir)
 }
 
-/// 全量二十一家 roster,**不按 detect 过滤**。这是全应用唯一的构造点:
+/// 全量二十二家 roster,**不按 detect 过滤**。这是全应用唯一的构造点:
 /// scanner/watcher/resume/Session locations 面板共享 Workbench 启动时的
-/// 同一份实例。缺根的家由各自 list_session_files 降级为 Ok(空)(scanner
-/// 对 Err 会 `?` 截断整轮,新 adapter 必须维持这条降级约定,contract 测试
+/// 同一份实例。缺根的家由各自 list_session_files 降级为 Ok(空)(Err 会让
+/// scanner 把这一家这一轮当成"读不出"冻结住,缺根不是读不出,contract 测试
 /// 有卡)。**不要为任何用途二次构造 roster**:根路径是构造时刻对 env
 /// (CODEX_HOME/XDG_DATA_HOME)与文件系统的快照,两份实例可能解析出不同的
 /// 根,UI 就会展示一个扫描器并不在读的路径。
@@ -289,7 +347,9 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
 /// **家数 ≠ 实例数**:Cursor 一家有两个数据源(CLI 的 agent-transcripts
 /// 与 IDE 的 state.vscdb),各占一个实例、共用 `AgentId::Cursor`。两源对
 /// 同一 composer 都有记录时(IDE 会话在 JSONL 侧是只含 turn_ended 的空壳),
-/// 由 scanner 的同家同 ID 去重按 mtime/size 裁决
+/// 由 scanner 的同家同 ID 去重按 `dedup_rank` 裁决。Kilo Code 同理:新版的
+/// kilo.db 在前,旧版扩展的任务目录在后(自定义 location 与远程挂载按
+/// `claims_custom_root` 挑实例)
 pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
     vec![
         Box::new(claude::ClaudeAdapter::new()),
@@ -314,6 +374,8 @@ pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(zcode::ZcodeAdapter::new()),
         Box::new(craft::CraftAdapter::new()),
         Box::new(devin::DevinAdapter::new()),
+        Box::new(opencode::OpencodeAdapter::kilo()),
+        Box::new(kilo::KiloLegacyAdapter::new()),
     ]
 }
 
@@ -342,9 +404,7 @@ fn create_adapters_with_root_overrides(
     let customs: Vec<Box<dyn AgentAdapter>> = custom_roots
         .iter()
         .filter_map(|(agent, root)| {
-            base.iter()
-                .find(|a| a.agent() == *agent)
-                .map(|a| a.with_custom_root(root.clone()))
+            custom_root_template(&base, *agent, root).map(|a| a.with_custom_root(root.clone()))
         })
         .collect();
     let mut v: Vec<Box<dyn AgentAdapter>> = Vec::new();
@@ -525,6 +585,13 @@ pub fn adapter_for<'a>(
     adapter_ix_for(adapters, agent, file_path).map(|ix| adapters[ix].as_ref())
 }
 
+/// 这条会话所在的家,子会话是不是各自完整的对话(`AgentAdapter::children_outlive_parent`):
+/// 是的话删除与 Clean Up 都不带上它们。详情页删除问根会话、Clean Up 载入索引时问每条子
+/// 会话——关系只连同家会话,两种问法是同一个答案
+pub fn children_outlive_parent(adapters: &[Box<dyn AgentAdapter>], meta: &SessionMeta) -> bool {
+    adapter_for(adapters, meta.agent, &meta.file_path).is_some_and(|a| a.children_outlive_parent())
+}
+
 /// 从解析后的消息派生 FTS 单元(text + tool 名称/输入摘要)。agent 对 Wake 自己的
 /// 查询(MCP 的 wake_* 工具、shell 里的 wake-cli / wake-mcp)不进索引:否则搜任何
 /// 词,第一条命中都是"上次搜这个词的那次调用",越用越吵(自指回声)。只跳过工具
@@ -555,6 +622,27 @@ fn units_from_messages(messages: &[TranscriptMessage]) -> Vec<IndexUnit> {
             }
         })
         .collect()
+}
+
+/// `units_from_messages` 的反向,新会话开场的交接从索引里取最后一问一答用
+/// (`Store::last_exchange`):用户那句话按标题同款清洗、slash 命令写回 `/name args`,清洗后为空
+/// 的(只剩命令输出之类)不算。两边的写法一起改,下面的测试卡着
+pub(crate) fn unit_prompt(text: &str) -> Option<String> {
+    Some(parse_utils::clean_prompt_line(text)).filter(|p| !p.is_empty())
+}
+
+/// 见 `unit_prompt`。单元 = 消息正文 + 换行 + 工具行,所以首行为空就是只有工具调用的消息,
+/// 不算回复;否则取正文里第一行有字的,代码块的边界行(带语言名的 ```rust 也是)与分隔线不算。
+/// 回复以代码块开头时取到的是块里的第一行——不跳过整块去找后面的话:单元里正文后面紧跟着
+/// 工具行,跳过去很可能取到 "Bash git push"
+pub(crate) fn unit_reply(text: &str) -> Option<&str> {
+    if text.lines().next().is_none_or(|l| l.trim().is_empty()) {
+        return None;
+    }
+    text.lines().find(|l| {
+        let l = l.trim_start();
+        !l.starts_with("```") && !l.starts_with("~~~") && l.chars().any(char::is_alphanumeric)
+    })
 }
 
 /// agent 在这些消息里查 Wake 的每一次调用:units_from_messages 把这些调用从索引里
@@ -791,6 +879,16 @@ pub fn project_instruction_sources(agent: AgentId) -> Vec<MemorySource> {
         AgentId::Cursor => vec![dir(".cursor/rules", "mdc"), file(".cursorrules")],
         AgentId::Kiro => vec![dir(".kiro/steering", "md")],
         AgentId::Copilot => vec![file(".github/copilot-instructions.md")],
+        AgentId::Antigravity => vec![
+            file("GEMINI.md"),
+            file("AGENTS.md"),
+            dir(".agent/rules", "md"),
+            // 持久记忆三件套(长期背景/阶段游标/活跃风险);handoff_*.md 等
+            // 会话交接产物是过程性中间件,不随此注册进入 Memory。
+            file("agent_memory/context.md"),
+            file("agent_memory/progress.md"),
+            file("agent_memory/bugs.md"),
+        ],
         _ => Vec::new(),
     }
 }
@@ -1240,6 +1338,42 @@ mod tests {
             model: None,
             images: Vec::new(),
         }
+    }
+
+    #[test]
+    fn units_read_back_into_the_last_question_and_reply() {
+        let units = units_from_messages(&[
+            msg(0, "", &[("Bash", "git diff")]),
+            msg(
+                1,
+                "```\nDone: pushed to main.\n```",
+                &[("Bash", "git push")],
+            ),
+            msg(2, "```rust\nfn main() {}\n```", &[("Bash", "cargo run")]),
+        ]);
+        assert_eq!(unit_reply(&units[0].text), None, "只有工具调用不算回复");
+        assert_eq!(unit_reply(&units[1].text), Some("Done: pushed to main."));
+        assert_eq!(
+            unit_reply(&units[2].text),
+            Some("fn main() {}"),
+            "带语言名的代码块边界不是回复"
+        );
+        assert_eq!(
+            unit_prompt(
+                "<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>--base main</command-args>"
+            )
+            .as_deref(),
+            Some("/review --base main")
+        );
+        assert_eq!(
+            unit_prompt("<command-name>/compact</command-name>").as_deref(),
+            Some("/compact")
+        );
+        assert_eq!(
+            unit_prompt("<local-command-stdout>Set model to opus</local-command-stdout>"),
+            None,
+            "命令输出不是人说的话"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::i18n::t;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::switch::Switch;
 use gpui_component::{
     h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _,
@@ -13,9 +13,9 @@ use wake_core::models::AgentId;
 
 use crate::format::tilde_path;
 use crate::ui::{
-    action_button, overlay_layers, show_in_fm, BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY,
-    FONT_HEADING, FONT_LABEL, FONT_TITLE, ICON_TEXT_GAP, RADIUS_BUTTON, SPACE_LG, SPACE_MD,
-    SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
+    action_button, overlay_layers, rails_factor, show_in_fm, zpx, Zpx, BUTTON_SM_H, FONT_BODY,
+    FONT_CAPTION, FONT_DISPLAY, FONT_HEADING, FONT_LABEL, FONT_TITLE, ICON_TEXT_GAP, RADIUS_BUTTON,
+    SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
 };
 use crate::update::{self, UpdateStatus};
 use crate::workbench::{
@@ -25,11 +25,18 @@ use crate::workbench::{
 use crate::{theme, theme::AppearancePreference};
 use std::rc::Rc;
 
-const SETTINGS_SIDEBAR_W: Pixels = px(180.);
-const SETTINGS_PAGE_TOP: Pixels = px(38.);
+const SETTINGS_SIDEBAR_W: Zpx = Zpx(180.);
+/// 侧栏顶上的标题栏条(gpui-component TitleBar 默认的 34px)。显式给成随缩放的同值:
+/// traffic light 随缩放挪位,这条不跟着变高的话灯就落到它的下沿上
+const SETTINGS_TITLEBAR_H: Zpx = Zpx(34.);
+const SETTINGS_PAGE_TOP: Zpx = Zpx(38.);
 /// Connect 页两条 Setup guide 的去处:MCP 面与命令行面各自的完整文档
 const CONNECT_GUIDE_URL: &str = "https://github.com/iAmCorey/Wake/blob/main/docs/mcp.md";
 const CONNECT_CLI_GUIDE_URL: &str = "https://github.com/iAmCorey/Wake/blob/main/docs/cli.md";
+const CONNECT_CLAUDE_PLUGIN_GUIDE_URL: &str =
+    "https://github.com/iAmCorey/Wake/blob/main/docs/cli.md#claude-code-plugin";
+const CONNECT_CODEX_PLUGIN_GUIDE_URL: &str =
+    "https://github.com/iAmCorey/Wake/blob/main/docs/cli.md#codex-plugin";
 
 fn icon(path: &'static str) -> Icon {
     Icon::empty().path(path)
@@ -54,6 +61,7 @@ fn format_storage_size(bytes: u64) -> String {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsPage {
     General,
+    Appearance,
     Locations,
     MemoryLocations,
     Remotes,
@@ -110,7 +118,7 @@ fn settings_page_header(title: &'static str, subtitle: &'static str, cx: &App) -
         .px(SPACE_XXL)
         .pt(SETTINGS_PAGE_TOP)
         .pb(SPACE_XL)
-        .gap(px(5.))
+        .gap(zpx(5.))
         .child(
             div()
                 .text_size(FONT_TITLE)
@@ -126,10 +134,28 @@ fn settings_page_header(title: &'static str, subtitle: &'static str, cx: &App) -
         )
 }
 
-/// "一张卡一行"的信息卡(Data 的 Storage、Connect 的 MCP server 共用):popover
-/// 底圆角卡,84px 行,主信息 FONT_BODY,副行由调用方给(caption 级),右侧一个操作
+/// 设置行右侧的下拉(语言、缩放):描边小按钮 + 当前值 + chevron,菜单项由调用方填
+fn select_control(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    menu_min_w: Zpx,
+    items: impl Fn(PopupMenu) -> PopupMenu + 'static,
+) -> AnyElement {
+    Button::new(id)
+        .outline()
+        .small()
+        .rounded(RADIUS_BUTTON)
+        .label(label)
+        .icon(icon("icons/chevron-down.svg").with_size(zpx(14.)))
+        .dropdown_menu(move |menu, _, _| items(menu.min_w(menu_min_w)))
+        .into_any_element()
+}
+
+/// "一张卡一行"的信息卡(Data、Connect、Updates 的卡与 General / Appearance 的设置行
+/// 共用):popover 底圆角卡,行高由调用方给(设置行 72、其余 84),主信息 FONT_BODY,
+/// 副行由调用方给(caption 级),右侧一个操作
 fn settings_info_card(
-    primary: &'static str,
+    primary: impl Into<SharedString>,
     details: Vec<AnyElement>,
     trailing: AnyElement,
     min_h: Pixels,
@@ -150,18 +176,23 @@ fn settings_info_card(
             h_flex()
                 .min_h(min_h)
                 .px(SPACE_LG)
+                .py(SPACE_MD)
                 .gap(SPACE_LG)
                 .items_center()
+                // 放不下时右侧控件换到下一行,而不是把标题挤成一字一行(界面放大后
+                // 设置窗常常比内容窄:窗口大小不随档位变)。100% 档宽度够,不换行,
+                // py 也小于 min_h 留的余量,版式不变
+                .flex_wrap()
                 .child(
                     v_flex()
                         .flex_1()
-                        .min_w_0()
-                        .gap(px(3.))
+                        .min_w(zpx(180.))
+                        .gap(zpx(3.))
                         .child(
                             div()
                                 .text_size(FONT_BODY)
                                 .text_color(theme.foreground)
-                                .child(primary),
+                                .child(primary.into()),
                         )
                         .children(details),
                 )
@@ -203,6 +234,10 @@ struct ConnectInfo {
     /// MCP clients 卡的三行:文案与片段来自 wake-core,与 `wake-mcp setup`
     /// 同源;GUI 只展示与复制,不代写别家配置
     snippets: Vec<wake_core::mcp::SetupSnippet>,
+    /// Claude Code plugin 与 Codex plugin 两块各一行,与 `wake-cli setup` 同源;这个平台不给
+    /// (`cli::AGENT_PLUGINS` 为假,即 Windows)时是 None,两块都不画
+    claude_plugin: Option<wake_core::mcp::SetupSnippet>,
+    codex_plugin: Option<wake_core::mcp::SetupSnippet>,
 }
 
 impl ConnectInfo {
@@ -211,6 +246,9 @@ impl ConnectInfo {
         let cli = BinaryFacts::probe("wake-cli");
         Self {
             snippets: wake_core::mcp::setup_snippets(std::path::Path::new(&mcp.path)),
+            claude_plugin: wake_core::cli::AGENT_PLUGINS
+                .then(wake_core::cli::claude_plugin_snippet),
+            codex_plugin: wake_core::cli::AGENT_PLUGINS.then(wake_core::cli::codex_plugin_snippet),
             cli_path_command: wake_core::cli::path_command(std::path::Path::new(&cli.path)),
             mcp,
             cli,
@@ -226,7 +264,7 @@ pub(crate) struct SettingsView {
     connect: ConnectInfo,
     /// Connect 页里展开了代码片段的行(按 snippets 下标);Settings 重开即复位
     connect_shown: std::collections::HashSet<usize>,
-    /// 刚复制过的按钮 id:按钮原地显示 "Copied" 1.6s。不用 toast——gpui-component 的
+    /// 刚复制过的按钮 id:图标原地变对勾(tooltip 说 Copied)1.6s。不用 toast——gpui-component 的
     /// 通知在窗口失活或被悬停时会暂停自动关闭,Settings 这种从属窗里它常常就
     /// 挂着不走(用户 2026-09-08 反馈);主界面的 Copy Session ID / Copy code 也
     /// 从不弹通知
@@ -238,6 +276,8 @@ pub(crate) struct SettingsView {
     /// notify),不在 render 里每帧算——原先 hover 一下就重查一遍库(2026-09-22 /simplify)
     locations: LocationSettingsSnapshot,
     memory_locations: MemoryLocationSettingsSnapshot,
+    /// 上次挪 traffic light 时的缩放档位(`ui_zoom::changed`)
+    zoom: u16,
     _workbench_observer: Option<Subscription>,
 }
 
@@ -256,9 +296,9 @@ fn row_menu(
         .ghost()
         .small()
         .rounded(RADIUS_BUTTON)
-        .icon(icon("icons/more-horizontal.svg").with_size(px(14.)))
+        .icon(icon("icons/more-horizontal.svg").with_size(zpx(14.)))
         .dropdown_menu(move |menu, _, _| {
-            let mut menu = menu.min_w(px(180.));
+            let mut menu = menu.min_w(zpx(180.));
             if let Some(edit) = edit.clone() {
                 menu = menu.item(
                     PopupMenuItem::new(t("Edit…")).on_click(move |_, window, cx| edit(window, cx)),
@@ -318,6 +358,7 @@ impl SettingsView {
             connect_shown: Default::default(),
             copied: None,
             copied_generation: 0,
+            zoom: crate::ui_zoom::percent(),
             locations: LocationSettingsSnapshot {
                 rows: Vec::new(),
                 diverged: false,
@@ -343,7 +384,7 @@ impl SettingsView {
         let workbench = self.workbench.clone();
         h_flex()
             .id(id)
-            .h(px(34.))
+            .h(zpx(34.))
             .w_full()
             .px(SPACE_MD)
             .gap(SPACE_SM)
@@ -361,8 +402,16 @@ impl SettingsView {
             .on_click(move |_, _, cx| {
                 workbench.update(cx, |this, cx| this.select_settings_page(page, cx));
             })
-            .child(icon(icon_path).with_size(px(15.)).flex_shrink_0())
-            .child(div().text_size(FONT_BODY).font_medium().child(label))
+            .child(icon(icon_path).with_size(zpx(15.)).flex_shrink_0())
+            // 放大档位下侧栏可能比标签窄:单行截断,行高是定的,换成两行会压到下一项
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(FONT_BODY)
+                    .font_medium()
+                    .child(label),
+            )
             .into_any_element()
     }
 
@@ -371,14 +420,22 @@ impl SettingsView {
         let show_titlebar = cfg!(target_os = "macos")
             || matches!(window.window_decorations(), Decorations::Client { .. });
 
+        // 侧栏随界面缩放放大,窗口不够宽时给内容区让位(与主窗的两条栏同一条规则)
+        let scale = rails_factor(
+            SETTINGS_SIDEBAR_W.0,
+            window.viewport_size().width,
+            crate::main_window::SETTINGS_MIN_SIZE.width,
+        );
         v_flex()
-            .w(SETTINGS_SIDEBAR_W)
+            .w(px(SETTINGS_SIDEBAR_W.0 * scale))
             .h_full()
             .flex_shrink_0()
             .bg(theme.sidebar)
             .border_r_1()
             .border_color(theme.sidebar_border)
-            .when(show_titlebar, |this| this.child(TitleBar::new()))
+            .when(show_titlebar, |this| {
+                this.child(TitleBar::new().h(SETTINGS_TITLEBAR_H))
+            })
             .child(
                 div()
                     .px(SPACE_LG)
@@ -389,82 +446,98 @@ impl SettingsView {
                     .text_color(theme.sidebar_foreground)
                     .child(t("Settings")),
             )
+            // 放大档位下两组导航可能比窗口高:包进滚动容器。上面那组 flex_1 把下面那组
+            // 顶到底;放不下时它不会被压到内容以下,于是溢出、可滚
             .child(
                 v_flex()
+                    .id("settings-nav-scroll")
                     .flex_1()
-                    .px(SPACE_SM)
-                    .gap(px(2.))
-                    .child(self.render_nav_item(
-                        "settings-general-nav",
-                        t("General"),
-                        "icons/settings.svg",
-                        SettingsPage::General,
-                        cx,
-                    ))
-                    .child(self.render_nav_item(
-                        "settings-locations-nav",
-                        t("Session locations"),
-                        "icons/hard-drive.svg",
-                        SettingsPage::Locations,
-                        cx,
-                    ))
-                    .child(self.render_nav_item(
-                        "settings-memory-locations-nav",
-                        t("Memory locations"),
-                        "icons/brain.svg",
-                        SettingsPage::MemoryLocations,
-                        cx,
-                    ))
-                    .child(self.render_nav_item(
-                        "settings-remotes-nav",
-                        t("Remote hosts"),
-                        "icons/server.svg",
-                        SettingsPage::Remotes,
-                        cx,
-                    ))
-                    .child(self.render_nav_item(
-                        "settings-connect-nav",
-                        t("Connect"),
-                        "icons/plug.svg",
-                        SettingsPage::Connect,
-                        cx,
-                    ))
-                    .child(self.render_nav_item(
-                        "settings-data-nav",
-                        t("Data"),
-                        "icons/database.svg",
-                        SettingsPage::Data,
-                        cx,
-                    )),
-            )
-            .child(
-                v_flex()
-                    .px(SPACE_SM)
-                    .pb(SPACE_SM)
-                    .gap(px(2.))
-                    .child(self.render_nav_item(
-                        "settings-updates-nav",
-                        t("Updates"),
-                        "icons/download.svg",
-                        SettingsPage::Updates,
-                        cx,
-                    ))
-                    .child(self.render_nav_item(
-                        "settings-about-nav",
-                        t("About"),
-                        "icons/info.svg",
-                        SettingsPage::About,
-                        cx,
-                    )),
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .px(SPACE_SM)
+                            .gap(zpx(2.))
+                            .child(self.render_nav_item(
+                                "settings-general-nav",
+                                t("General"),
+                                "icons/settings.svg",
+                                SettingsPage::General,
+                                cx,
+                            ))
+                            .child(self.render_nav_item(
+                                "settings-appearance-nav",
+                                t("Appearance"),
+                                "icons/palette.svg",
+                                SettingsPage::Appearance,
+                                cx,
+                            ))
+                            .child(self.render_nav_item(
+                                "settings-locations-nav",
+                                t("Session locations"),
+                                "icons/hard-drive.svg",
+                                SettingsPage::Locations,
+                                cx,
+                            ))
+                            .child(self.render_nav_item(
+                                "settings-memory-locations-nav",
+                                t("Memory locations"),
+                                "icons/brain.svg",
+                                SettingsPage::MemoryLocations,
+                                cx,
+                            ))
+                            .child(self.render_nav_item(
+                                "settings-remotes-nav",
+                                t("Remote hosts"),
+                                "icons/server.svg",
+                                SettingsPage::Remotes,
+                                cx,
+                            ))
+                            .child(self.render_nav_item(
+                                "settings-connect-nav",
+                                t("Connect"),
+                                "icons/plug.svg",
+                                SettingsPage::Connect,
+                                cx,
+                            ))
+                            .child(self.render_nav_item(
+                                "settings-data-nav",
+                                t("Data"),
+                                "icons/database.svg",
+                                SettingsPage::Data,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        v_flex()
+                            .px(SPACE_SM)
+                            .pb(SPACE_SM)
+                            .gap(zpx(2.))
+                            .child(self.render_nav_item(
+                                "settings-updates-nav",
+                                t("Updates"),
+                                "icons/download.svg",
+                                SettingsPage::Updates,
+                                cx,
+                            ))
+                            .child(self.render_nav_item(
+                                "settings-about-nav",
+                                t("About"),
+                                "icons/info.svg",
+                                SettingsPage::About,
+                                cx,
+                            )),
+                    ),
             )
             .into_any_element()
     }
 
-    /// General 页的设置行:与 Data/Connect 的信息卡同一张卡,只是矮一档
-    /// (72 是 Appearance 行的用户定稿值),副行是 caption 级说明
+    /// General / Appearance 页的设置行:与 Data / Connect / Updates 同一张信息卡,只是矮
+    /// 一档(72 是 Theme 行的用户定稿值),副行是 caption 级说明
     fn setting_row(
         title: &'static str,
-        subtitle: &'static str,
+        subtitle: impl IntoElement,
         control: impl IntoElement,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -477,56 +550,69 @@ impl SettingsView {
             title,
             vec![caption],
             control.into_any_element(),
-            px(72.),
+            zpx(72.),
             cx,
         )
         .into_any_element()
     }
 
     /// 语言选择:System + English + 装好的语言包。选项数量随语言包增减,
-    /// 所以是下拉而不是 Appearance 那样的分段控件
+    /// 所以是下拉而不是 Theme 那样的分段控件
     fn language_control(&self) -> AnyElement {
         // 直接读全局:镜像成字段就要在每个切换点写回,而 `apply_language`
         // 改的是全局(appearance 那个字段正是这么漂的)
         let current = crate::i18n::preference().map(|locale| locale.tag);
-        Button::new("settings-language")
-            .outline()
-            .small()
-            .rounded(RADIUS_BUTTON)
-            .label(current.map_or(t("System"), |tag| {
+        let label = current.map_or(t("System"), |tag| {
+            crate::i18n::available()
+                .iter()
+                .find(|locale| locale.tag == tag)
+                .map_or(t("System"), |locale| locale.name)
+        });
+        select_control("settings-language", label, Zpx(160.), move |mut menu| {
+            // 选项只在菜单打开时才需要,`available()` 又是 'static 切片
+            // ——留在闭包里就不必每帧建一个 Vec 再 clone 一份进来
+            let options = std::iter::once((None, t("System"))).chain(
                 crate::i18n::available()
                     .iter()
-                    .find(|locale| locale.tag == tag)
-                    .map_or(t("System"), |locale| locale.name)
-            }))
-            .icon(icon("icons/chevron-down.svg").with_size(px(14.)))
-            .dropdown_menu(move |mut menu, _, _| {
-                // 选项只在菜单打开时才需要,`available()` 又是 'static 切片
-                // ——留在闭包里就不必每帧建一个 Vec 再 clone 一份进来
-                menu = menu.min_w(px(160.));
-                let options = std::iter::once((None, t("System"))).chain(
-                    crate::i18n::available()
-                        .iter()
-                        .map(|locale| (Some(locale.tag), locale.name)),
-                );
-                for (tag, name) in options {
-                    menu = menu.item(PopupMenuItem::new(name).checked(tag == current).on_click(
-                        move |_, window, cx| {
-                            if let Err(error) = crate::i18n::set_language(tag, cx) {
-                                window.push_notification(
-                                    gpui_component::notification::Notification::error(crate::tf!(
-                                        "Couldn't save language: {}",
-                                        error
-                                    )),
-                                    cx,
-                                );
-                            }
-                        },
-                    ));
+                    .map(|locale| (Some(locale.tag), locale.name)),
+            );
+            for (tag, name) in options {
+                menu = menu.item(PopupMenuItem::new(name).checked(tag == current).on_click(
+                    move |_, window, cx| {
+                        if let Err(error) = crate::i18n::set_language(tag, cx) {
+                            window.push_notification(
+                                gpui_component::notification::Notification::error(crate::tf!(
+                                    "Couldn't save language: {}",
+                                    error
+                                )),
+                                cx,
+                            );
+                        }
+                    },
+                ));
+            }
+            menu
+        })
+    }
+
+    /// 界面缩放档位:与 ⌘+ / ⌘− / ⌘0、显示菜单是同一个设置。档位多,与语言一样用下拉
+    fn zoom_control(&self) -> AnyElement {
+        let current = crate::ui_zoom::percent();
+        select_control(
+            "settings-zoom",
+            crate::ui_zoom::label(current),
+            Zpx(120.),
+            move |mut menu| {
+                for level in crate::ui_zoom::LEVELS {
+                    menu = menu.item(
+                        PopupMenuItem::new(crate::ui_zoom::label(level))
+                            .checked(level == current)
+                            .on_click(move |_, _, cx| crate::ui_zoom::change(level, cx)),
+                    );
                 }
                 menu
-            })
-            .into_any_element()
+            },
+        )
     }
 
     fn appearance_button(
@@ -551,7 +637,7 @@ impl SettingsView {
                     .active(theme.popover),
             )
             .small()
-            .w(px(64.))
+            .w(zpx(64.))
             .rounded(RADIUS_BUTTON)
             .label(label)
             .selected(selected)
@@ -573,76 +659,106 @@ impl SettingsView {
             }))
     }
 
-    fn render_general(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme();
+    /// 设置各页(Session / Memory locations 与 Remote hosts 之外)的骨架:页头 + 可滚动的
+    /// 内容列(界面放大后卡片会换行变高,一屏放不下)
+    fn rows_page(
+        id: &'static str,
+        title: &'static str,
+        subtitle: &'static str,
+        gap: Zpx,
+        rows: impl IntoIterator<Item = AnyElement>,
+        cx: &App,
+    ) -> AnyElement {
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(theme.background)
+            .bg(cx.theme().background)
+            .child(settings_page_header(title, subtitle, cx))
             .child(
                 v_flex()
-                    .flex_shrink_0()
+                    .id(id)
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .px(SPACE_XXL)
-                    .pt(SETTINGS_PAGE_TOP)
-                    .pb(SPACE_XL)
-                    .gap(px(5.))
-                    .child(
-                        div()
-                            .text_size(FONT_TITLE)
-                            .font_semibold()
-                            .text_color(theme.foreground)
-                            .child(t("General")),
-                    )
-                    .child(
-                        div()
-                            .text_size(FONT_CAPTION)
-                            .text_color(theme.muted_foreground)
-                            .child(t("Customize how Wake looks and reads.")),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .px(SPACE_XXL)
-                    .gap(SPACE_MD)
-                    .child(Self::setting_row(
-                        t("Appearance"),
-                        t("Follow the system or keep Wake light or dark."),
-                        h_flex()
-                            .h(BUTTON_SM_H + px(4.))
-                            .p(px(2.))
-                            .rounded(theme.radius)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.secondary)
-                            .child(self.appearance_button(
-                                "appearance-system",
-                                t("System"),
-                                AppearancePreference::System,
-                                cx,
-                            ))
-                            .child(self.appearance_button(
-                                "appearance-light",
-                                t("Light"),
-                                AppearancePreference::Light,
-                                cx,
-                            ))
-                            .child(self.appearance_button(
-                                "appearance-dark",
-                                t("Dark"),
-                                AppearancePreference::Dark,
-                                cx,
-                            )),
-                        cx,
-                    ))
-                    .child(Self::setting_row(
-                        t("Language"),
-                        t("Follow the system language, or pick one."),
-                        self.language_control(),
-                        cx,
-                    )),
+                    .pb(SPACE_XXL)
+                    .gap(gap)
+                    .children(rows),
             )
             .into_any_element()
+    }
+
+    fn render_general(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let rows = [Self::setting_row(
+            t("Language"),
+            t("Follow the system language, or pick one."),
+            self.language_control(),
+            cx,
+        )];
+        Self::rows_page(
+            "settings-general-scroll",
+            t("General"),
+            t("Choose the language Wake uses."),
+            SPACE_MD,
+            rows,
+            cx,
+        )
+    }
+
+    /// 外观与界面缩放(2026-10-08 用户定:自成一页,不放 General)
+    fn render_appearance(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let modes = h_flex()
+            .h(BUTTON_SM_H + zpx(4.))
+            .p(zpx(2.))
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .child(self.appearance_button(
+                "appearance-system",
+                t("System"),
+                AppearancePreference::System,
+                cx,
+            ))
+            .child(self.appearance_button(
+                "appearance-light",
+                t("Light"),
+                AppearancePreference::Light,
+                cx,
+            ))
+            .child(self.appearance_button(
+                "appearance-dark",
+                t("Dark"),
+                AppearancePreference::Dark,
+                cx,
+            ));
+        // 快捷键自成一段、不在中间断行:gpui 在每个符号前都允许折行,窄的时候会把
+        // "⌘" 和 "+" 拆到两行。放不下就整段换到下一行
+        let zoom_caption = h_flex()
+            .w_full()
+            .flex_wrap()
+            .gap_x(zpx(4.))
+            .child(t("Make text and controls larger or smaller."))
+            .child(div().whitespace_nowrap().child(crate::ui_zoom::key_hints()));
+        let rows = [
+            Self::setting_row(
+                t("Theme"),
+                t("Follow the system or keep Wake light or dark."),
+                modes,
+                cx,
+            ),
+            Self::setting_row(t("Zoom"), zoom_caption, self.zoom_control(), cx),
+        ];
+        Self::rows_page(
+            "settings-appearance-scroll",
+            t("Appearance"),
+            t("Customize how Wake looks and reads."),
+            SPACE_MD,
+            rows,
+            cx,
+        )
     }
 
     fn render_data(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -667,7 +783,7 @@ impl SettingsView {
         let reveal_path = snapshot.raw_path.clone();
         let show_in_finder = settings_button(
             Button::new("settings-show-data")
-                .icon(icon("icons/folder.svg").with_size(px(13.)))
+                .icon(icon("icons/folder.svg").with_size(zpx(13.)))
                 .label(show_in_fm()),
             cx,
         )
@@ -689,62 +805,61 @@ impl SettingsView {
                 .into_any_element(),
         ];
 
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .bg(theme.background)
-            .child(settings_page_header(
-                t("Data"),
-                t("See where Wake stores local data. Sessions refresh automatically."),
+        let rows = [
+            div()
+                .text_size(FONT_CAPTION)
+                .font_semibold()
+                .text_color(theme.foreground)
+                .child(t("Storage"))
+                .into_any_element(),
+            settings_info_card(
+                t("Wake data"),
+                details,
+                show_in_finder.into_any_element(),
+                zpx(84.),
                 cx,
-            ))
-            .child(
-                v_flex()
-                    .px(SPACE_XXL)
-                    .gap(SPACE_SM)
-                    .child(
-                        div()
-                            .text_size(FONT_CAPTION)
-                            .font_semibold()
-                            .text_color(theme.foreground)
-                            .child(t("Storage")),
-                    )
-                    .child(settings_info_card(
-                        t("Wake data"),
-                        details,
-                        show_in_finder.into_any_element(),
-                        px(84.),
-                        cx,
-                    )),
             )
-            .into_any_element()
+            .into_any_element(),
+        ];
+        Self::rows_page(
+            "settings-data-scroll",
+            t("Data"),
+            t("See where Wake stores local data. Sessions refresh automatically."),
+            SPACE_SM,
+            rows,
+            cx,
+        )
     }
 
-    /// Settings → Connect 的复制按钮:写剪贴板,按钮原地变 "Copied" 片刻后复原
+    /// Settings → Connect 的复制钮:只有图标,说明在 tooltip——卡上已经摆着要复制的东西或
+    /// 一句用法,按钮再写一遍 "Copy path" / "Copy command" 是重复(用户 2026-10-09 定,整页
+    /// 统一)。写剪贴板后图标原地变对勾、tooltip 说 Copied,1.6s 复原
     fn copy_button(
         &self,
         id: SharedString,
-        label: &'static str,
+        tooltip: &'static str,
+        text: String,
+        cx: &Context<Self>,
+    ) -> Button {
+        self.copy_button_with("icons/copy.svg", id, tooltip, text, cx)
+    }
+
+    /// 同一张卡上的第二个复制钮换个字形:wake-cli 卡的路径与"放进 PATH"的命令并排,
+    /// 两个一样的图标分不清
+    fn copy_button_with(
+        &self,
+        glyph: &'static str,
+        id: SharedString,
+        tooltip: &'static str,
         text: String,
         cx: &Context<Self>,
     ) -> Button {
         let copied = self.copied.as_ref() == Some(&id);
         let clicked_id = id.clone();
-        settings_button(
-            Button::new(id)
-                .icon(
-                    icon(if copied {
-                        "icons/check.svg"
-                    } else {
-                        "icons/copy.svg"
-                    })
-                    .with_size(px(13.)),
-                )
-                .label(if copied { t("Copied") } else { label }),
-            cx,
-        )
-        .on_click(cx.listener(move |this, _, _, cx| {
+        let button = Button::new(id)
+            .icon(icon(if copied { "icons/check.svg" } else { glyph }).with_size(zpx(13.)))
+            .tooltip(if copied { t("Copied") } else { tooltip });
+        settings_button(button, cx).on_click(cx.listener(move |this, _, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             this.show_copied(clicked_id.clone(), cx);
         }))
@@ -770,11 +885,11 @@ impl SettingsView {
         .detach();
     }
 
-    /// Settings → Connect:把 Wake 的索引以 MCP 只读暴露给 coding agent。页面只放
-    /// **状态与动作**:server 卡(路径 + Copy path)、Agents 卡(每家一行一个
-    /// Copy 钮)、一句 caption 加 Setup guide 链接。代码块与工具表都不放——那是
-    /// README 的内容,塞进设置窗怎么排都像教程(用户 2026-09-08 三轮定稿)。
-    /// 只展示与复制,不代写别家配置;片段与 `wake-mcp setup` 同源(wake-core mcp)
+    /// Settings → Connect:把 Wake 的索引只读接给 coding agent。页面只放**状态与动作**:
+    /// 每块一张卡(二进制路径、一句用法或每家一行)+ 只有图标的复制钮,区块标题右端挂
+    /// Setup guide。代码块与工具表都不放——那是 README 的内容,塞进设置窗怎么排都像教程
+    /// (用户 2026-09-08 三轮定稿)。只展示与复制,不代写别家配置;片段与 `wake-mcp setup` /
+    /// `wake-cli setup` 同源(wake-core 的 mcp / cli)
     fn render_connect(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let dark = theme.mode.is_dark();
@@ -811,7 +926,7 @@ impl SettingsView {
                         } else {
                             "icons/chevron-right.svg"
                         })
-                        .with_size(px(13.)),
+                        .with_size(zpx(13.)),
                     )
                     .label(if shown { t("Hide") } else { t("Show") })
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -828,17 +943,17 @@ impl SettingsView {
                     .child(
                         h_flex()
                             .w_full()
-                            .min_h(px(52.))
+                            .min_h(zpx(52.))
                             .px(SPACE_LG)
                             .py(SPACE_SM)
                             .gap(ICON_TEXT_GAP)
                             .items_center()
-                            .child(img(s.agent.brand_icon(dark)).size(px(17.)).flex_shrink_0())
+                            .child(img(s.agent.brand_icon(dark)).size(zpx(17.)).flex_shrink_0())
                             .child(
                                 v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .gap(px(2.))
+                                    .gap(zpx(2.))
                                     .child(
                                         div()
                                             .text_size(FONT_BODY)
@@ -864,7 +979,7 @@ impl SettingsView {
                         this.child(
                             // 左缘对齐到文字轴:行内边距 + 图标 17 + 间距 12
                             v_flex()
-                                .ml(SPACE_LG + px(17.) + SPACE_MD)
+                                .ml(SPACE_LG + zpx(17.) + SPACE_MD)
                                 .mr(SPACE_LG)
                                 .mb(SPACE_MD)
                                 .px(SPACE_MD)
@@ -910,7 +1025,7 @@ impl SettingsView {
             settings_info_card(
                 primary,
                 mono_details(f.display.clone(), f.exists),
-                // Copy path 恒在最右,两张卡的同名动作才对得齐;附加动作放它左边
+                // 复制路径的钮恒在最右,两张卡的同一个动作才对得齐;附加动作放它左边
                 h_flex()
                     .flex_shrink_0()
                     .gap(SPACE_SM)
@@ -918,14 +1033,16 @@ impl SettingsView {
                     .children(extra)
                     .child(self.copy_button(id.into(), t("Copy path"), f.path.clone(), cx))
                     .into_any_element(),
-                px(84.),
+                zpx(84.),
                 cx,
             )
+            .into_any_element()
         };
         let copy_cli_command = info.cli_path_command.clone().map(|cmd| {
-            self.copy_button(
+            self.copy_button_with(
+                "icons/terminal.svg",
                 "connect-copy-cli-command".into(),
-                t("Copy command"),
+                t("Copy the command that adds wake-cli to PATH"),
                 cmd,
                 cx,
             )
@@ -941,9 +1058,22 @@ impl SettingsView {
                 cx,
             )
             .into_any_element(),
-            px(84.),
+            zpx(84.),
             cx,
         );
+        // 一行卡:区块标题已经点了名,卡里只放一句怎么用 + 复制钮(用户 2026-10-09:名字行
+        // 多余、两行没必要、一张等宽一张正文挨着太杂;命令在复制钮里,不必摆出来)
+        let one_line_card = |s: &wake_core::mcp::SetupSnippet, id: &'static str| {
+            settings_info_card(
+                t(s.hint),
+                Vec::new(),
+                self.copy_button(id.into(), t(s.copy_label), s.text.clone(), cx)
+                    .into_any_element(),
+                zpx(48.),
+                cx,
+            )
+            .into_any_element()
+        };
 
         let section = |label: &'static str| {
             div()
@@ -955,7 +1085,7 @@ impl SettingsView {
         };
         // 区块标题右侧的文档链接:MCP 面与命令行面各链自己那份,页尾只放一条
         // 会让读 CLI 那半页的人点进 MCP 的参考里。设置窗里不放文档,所以这页
-        // 只有状态、动作与这两个去处,没有解释性的散文(用户 2026-09-11 定)
+        // 只有状态、动作与这几个去处,没有解释性的散文(用户 2026-09-11 定)
         let titled = |label: &'static str, guide: Option<(&'static str, &'static str)>| {
             h_flex()
                 .flex_shrink_0()
@@ -974,69 +1104,92 @@ impl SettingsView {
                 }))
         };
 
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .bg(theme.background)
-            .child(settings_page_header(
-                t("Connect"),
-                t("Let your coding agents look up your past sessions from Wake."),
-                cx,
-            ))
-            .child(
-                v_flex()
-                    .id("settings-connect-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px(SPACE_XXL)
-                    .pb(SPACE_XXL)
-                    .gap(SPACE_SM)
-                    // 四个区块同一种写法,有没有文档链接写在参数里,不靠两种拼法
-                    // 区分。规则一句话:**每个面的第一个区块挂自己的文档**——
-                    // MCP 面 = MCP server + MCP clients,命令行面 = Command line
-                    // + Skill,所以链接落在第一、第三块上。第五个区块该不该有
-                    // 链接,照这条判就行,不用再拍脑袋
-                    .child(titled(
-                        t("MCP server"),
-                        Some(("connect-setup-guide", CONNECT_GUIDE_URL)),
-                    ))
-                    .child(binary_card(
-                        "wake-mcp",
-                        "connect-copy-path",
-                        &info.mcp,
-                        None,
-                    ))
-                    .child(titled(t("MCP clients"), None).pt(SPACE_LG))
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .flex_shrink_0()
-                            .overflow_hidden()
-                            .rounded(theme.radius_lg)
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.popover)
-                            .children(agent_rows),
-                    )
-                    .child(
-                        titled(
-                            t("Command line"),
-                            Some(("connect-cli-setup-guide", CONNECT_CLI_GUIDE_URL)),
-                        )
-                        .pt(SPACE_LG),
-                    )
-                    .child(binary_card(
-                        "wake-cli",
-                        "connect-copy-cli-path",
-                        &info.cli,
-                        copy_cli_command,
-                    ))
-                    .child(titled(t("Skill"), None).pt(SPACE_LG))
-                    .child(skill_card),
-            )
-            .into_any_element()
+        // 区块同一种写法:(标题, 文档链接, 卡),有没有链接、有没有这块都写在数据里,
+        // 间距一律"不是第一块就加",不靠各块自己记。链接的规则一句话:**每个面的第一个
+        // 区块挂自己的文档**——Claude Code plugin、Codex plugin 各是一面,MCP 面 = MCP server
+        // + MCP clients,命令行面 = Command line + Skill。两家的插件放最前:一条命令就把 MCP
+        // 与开场交接一起装好,是最省事的那条路。标题用各家的正名(用户 2026-10-09 定:不自己
+        // 起名字;Codex 那块原先是它官方的 hooks 配置,2026-10-10 有了真正的 Codex 插件才改名);
+        // 这两块 Windows 上没有(片段给 None)
+        let sections = [
+            (
+                t("Claude Code plugin"),
+                Some((
+                    "connect-claude-plugin-setup-guide",
+                    CONNECT_CLAUDE_PLUGIN_GUIDE_URL,
+                )),
+                info.claude_plugin
+                    .as_ref()
+                    .map(|s| one_line_card(s, "connect-copy-claude-plugin")),
+            ),
+            (
+                t("Codex plugin"),
+                Some((
+                    "connect-codex-plugin-setup-guide",
+                    CONNECT_CODEX_PLUGIN_GUIDE_URL,
+                )),
+                info.codex_plugin
+                    .as_ref()
+                    .map(|s| one_line_card(s, "connect-copy-codex-plugin")),
+            ),
+            (
+                t("MCP server"),
+                Some(("connect-setup-guide", CONNECT_GUIDE_URL)),
+                Some(binary_card(
+                    "wake-mcp",
+                    "connect-copy-path",
+                    &info.mcp,
+                    None,
+                )),
+            ),
+            (
+                t("MCP clients"),
+                None,
+                Some(
+                    v_flex()
+                        .w_full()
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .rounded(theme.radius_lg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.popover)
+                        .children(agent_rows)
+                        .into_any_element(),
+                ),
+            ),
+            (
+                t("Command line"),
+                Some(("connect-cli-setup-guide", CONNECT_CLI_GUIDE_URL)),
+                Some(binary_card(
+                    "wake-cli",
+                    "connect-copy-cli-path",
+                    &info.cli,
+                    copy_cli_command,
+                )),
+            ),
+            (t("Skill"), None, Some(skill_card.into_any_element())),
+        ];
+        let rows = sections
+            .into_iter()
+            .filter_map(|(title, guide, card)| card.map(|card| (title, guide, card)))
+            .enumerate()
+            .flat_map(|(ix, (title, guide, card))| {
+                [
+                    titled(title, guide)
+                        .when(ix > 0, |this| this.pt(SPACE_LG))
+                        .into_any_element(),
+                    card,
+                ]
+            });
+        Self::rows_page(
+            "settings-connect-scroll",
+            t("Connect"),
+            t("Let your coding agents look up your past sessions from Wake."),
+            SPACE_SM,
+            rows,
+            cx,
+        )
     }
 
     fn about_link(
@@ -1074,12 +1227,12 @@ impl SettingsView {
             .bg(theme.background)
             .child(
                 v_flex()
-                    .w(px(360.))
+                    .w(zpx(360.))
                     .items_center()
-                    .pt(px(52.))
+                    .pt(zpx(52.))
                     .child(
                         img("brands/wake.svg")
-                            .size(px(78.))
+                            .size(zpx(78.))
                             .flex_shrink_0()
                             .mb(SPACE_MD),
                     )
@@ -1105,13 +1258,13 @@ impl SettingsView {
                             .text_color(theme.muted_foreground)
                             .child(t("All your AI agent sessions, in one place.")),
                     )
-                    .child(div().mt(px(14.)).child(self.about_link(
+                    .child(div().mt(zpx(14.)).child(self.about_link(
                         "about-github",
                         "GitHub ↗",
                         "https://github.com/iAmCorey/Wake",
                         cx,
                     )))
-                    .child(div().w(px(32.)).h(px(1.)).my(SPACE_LG).bg(theme.border))
+                    .child(div().w(zpx(32.)).h(px(1.)).my(SPACE_LG).bg(theme.border))
                     .child(
                         div()
                             .text_size(FONT_LABEL)
@@ -1186,70 +1339,29 @@ impl SettingsView {
             });
         }
 
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .bg(theme.background)
-            .child(
-                v_flex()
-                    .flex_shrink_0()
-                    .px(SPACE_XXL)
-                    .pt(SETTINGS_PAGE_TOP)
-                    .pb(SPACE_XL)
-                    .gap(px(5.))
-                    .child(
-                        div()
-                            .text_size(FONT_TITLE)
-                            .font_semibold()
-                            .text_color(theme.foreground)
-                            .child(t("Updates")),
-                    )
-                    .child(
-                        div()
-                            .text_size(FONT_CAPTION)
-                            .text_color(theme.muted_foreground)
-                            .child(t("Keep Wake up to date.")),
-                    ),
-            )
-            .child(
-                v_flex().px(SPACE_XXL).child(
-                    h_flex()
-                        .min_h(px(84.))
-                        .w_full()
-                        .px(SPACE_LG)
-                        .gap(SPACE_LG)
-                        .items_center()
-                        .rounded(theme.radius_lg)
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.popover)
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap(px(3.))
-                                .child(
-                                    div()
-                                        .text_size(FONT_BODY)
-                                        .text_color(theme.foreground)
-                                        .child(format!("Wake {}", env!("CARGO_PKG_VERSION"))),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(FONT_CAPTION)
-                                        .text_color(if matches!(status, UpdateStatus::Failed) {
-                                            theme.danger
-                                        } else {
-                                            theme.muted_foreground
-                                        })
-                                        .child(status_message),
-                                ),
-                        )
-                        .child(action),
-                ),
-            )
-            .into_any_element()
+        let card = settings_info_card(
+            concat!("Wake ", env!("CARGO_PKG_VERSION")),
+            vec![div()
+                .text_size(FONT_CAPTION)
+                .text_color(if matches!(status, UpdateStatus::Failed) {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                })
+                .child(status_message)
+                .into_any_element()],
+            action.into_any_element(),
+            zpx(84.),
+            cx,
+        );
+        Self::rows_page(
+            "settings-updates-scroll",
+            t("Updates"),
+            t("Keep Wake up to date."),
+            SPACE_MD,
+            [card.into_any_element()],
+            cx,
+        )
     }
 
     /// 两页 location 面板的快照重读(见字段注释):只刷当前显示的那页——切页走 Workbench
@@ -1377,7 +1489,7 @@ impl SettingsView {
         let theme = cx.theme();
         h_flex()
             .id(("settings-location-row", ix))
-            .min_h(px(60.))
+            .min_h(zpx(60.))
             .w_full()
             .px(SPACE_LG)
             .gap(SPACE_MD)
@@ -1386,7 +1498,7 @@ impl SettingsView {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap(px(3.))
+                    .gap(zpx(3.))
                     .child(
                         div()
                             .w_full()
@@ -1439,10 +1551,10 @@ impl SettingsView {
             .gap(SPACE_SM)
             .child(
                 h_flex()
-                    .h(px(24.))
+                    .h(zpx(24.))
                     .gap(ICON_TEXT_GAP)
                     .items_center()
-                    .child(img(agent.brand_icon(dark)).size(px(17.)).flex_shrink_0())
+                    .child(img(agent.brand_icon(dark)).size(zpx(17.)).flex_shrink_0())
                     .child(
                         div()
                             .text_size(FONT_CAPTION)
@@ -1518,7 +1630,7 @@ impl SettingsView {
                     .child(
                         h_flex()
                             .id("settings-unavailable-locations")
-                            .h(px(36.))
+                            .h(zpx(36.))
                             .w_full()
                             .pr(SPACE_SM)
                             .gap(SPACE_SM)
@@ -1533,7 +1645,7 @@ impl SettingsView {
                             }))
                             .child(
                                 div()
-                                    .w(px(17.))
+                                    .w(zpx(17.))
                                     .flex_shrink_0()
                                     .flex()
                                     .items_center()
@@ -1544,7 +1656,7 @@ impl SettingsView {
                                         } else {
                                             "icons/chevron-right.svg"
                                         })
-                                        .with_size(px(13.)),
+                                        .with_size(zpx(13.)),
                                     ),
                             )
                             .child(
@@ -1632,7 +1744,7 @@ impl SettingsView {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .gap(px(5.))
+                            .gap(zpx(5.))
                             .child(
                                 div()
                                     .text_size(FONT_TITLE)
@@ -1650,7 +1762,7 @@ impl SettingsView {
                     .child(
                         settings_button(
                             Button::new("settings-add-location")
-                                .icon(icon("icons/plus.svg").with_size(px(13.)))
+                                .icon(icon("icons/plus.svg").with_size(zpx(13.)))
                                 .label(t("Add location")),
                             cx,
                         )
@@ -1663,10 +1775,10 @@ impl SettingsView {
                             .ghost()
                             .small()
                             .rounded(RADIUS_BUTTON)
-                            .icon(icon("icons/more-horizontal.svg").with_size(px(14.)))
+                            .icon(icon("icons/more-horizontal.svg").with_size(zpx(14.)))
                             .dropdown_menu(move |menu, _, _| {
                                 let workbench = restore_workbench.clone();
-                                menu.min_w(px(180.)).item(
+                                menu.min_w(zpx(180.)).item(
                                     PopupMenuItem::new(t("Restore defaults"))
                                         .disabled(!diverged)
                                         .on_click(move |_, window, cx| {
@@ -1685,7 +1797,7 @@ impl SettingsView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px(SPACE_XXL)
-                    .pb(px(40.))
+                    .pb(zpx(40.))
                     .gap(SPACE_XL)
                     .children(list),
             )
@@ -1717,13 +1829,13 @@ impl SettingsView {
                     .ghost()
                     .small()
                     .rounded(RADIUS_BUTTON)
-                    .icon(icon("icons/more-horizontal.svg").with_size(px(14.)))
+                    .icon(icon("icons/more-horizontal.svg").with_size(zpx(14.)))
                     .dropdown_menu(move |menu, _, _| {
                         let sync_workbench = menu_workbench.clone();
                         let sync_name = menu_name.clone();
                         let remove_workbench = menu_workbench.clone();
                         let remove_name = menu_name.clone();
-                        menu.min_w(px(180.))
+                        menu.min_w(zpx(180.))
                             .item(
                                 PopupMenuItem::new(t("Sync now"))
                                     .disabled(syncing || !enabled)
@@ -1750,7 +1862,7 @@ impl SettingsView {
                     .child(
                         h_flex()
                             .id(("settings-remote-host-row", ix))
-                            .min_h(px(60.))
+                            .min_h(zpx(60.))
                             .w_full()
                             .px(SPACE_LG)
                             .gap(SPACE_MD)
@@ -1759,7 +1871,7 @@ impl SettingsView {
                                 v_flex()
                                     .flex_1()
                                     .min_w_0()
-                                    .gap(px(3.))
+                                    .gap(zpx(3.))
                                     .child(
                                         div()
                                             .w_full()
@@ -1829,7 +1941,7 @@ impl SettingsView {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .gap(px(5.))
+                            .gap(zpx(5.))
                             .child(
                                 div()
                                     .text_size(FONT_TITLE)
@@ -1851,7 +1963,7 @@ impl SettingsView {
                         this.child(
                             settings_button(
                                 Button::new("settings-sync-remotes")
-                                    .icon(icon("icons/refresh-cw.svg").with_size(px(13.)))
+                                    .icon(icon("icons/refresh-cw.svg").with_size(zpx(13.)))
                                     .label(if syncing { t("Syncing…") } else { t("Sync now") }),
                                 cx,
                             )
@@ -1865,7 +1977,7 @@ impl SettingsView {
                     .child(
                         settings_button(
                             Button::new("settings-add-remote-host")
-                                .icon(icon("icons/plus.svg").with_size(px(13.)))
+                                .icon(icon("icons/plus.svg").with_size(zpx(13.)))
                                 .label(t("Add host")),
                             cx,
                         )
@@ -1882,7 +1994,7 @@ impl SettingsView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px(SPACE_XXL)
-                    .pb(px(40.))
+                    .pb(zpx(40.))
                     .gap(SPACE_XL)
                     .when(has_hosts, |this| {
                         this.child(
@@ -1920,12 +2032,16 @@ impl Focusable for SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::ui_zoom::changed(&mut self.zoom) {
+            crate::ui_zoom::move_traffic_lights(crate::ui_zoom::SETTINGS_LIGHTS_TOP, window);
+        }
         let background = cx.theme().background;
         let foreground = cx.theme().foreground;
         let sidebar = self.render_sidebar(window, cx);
         let selected_page = self.workbench.read(cx).settings_page();
         let content = match selected_page {
             SettingsPage::General => self.render_general(cx),
+            SettingsPage::Appearance => self.render_appearance(cx),
             SettingsPage::Locations => self.render_locations(cx).into_any_element(),
             SettingsPage::MemoryLocations => self.render_memory_locations(cx).into_any_element(),
             SettingsPage::Remotes => self.render_remotes(cx),

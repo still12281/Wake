@@ -40,7 +40,7 @@ pub enum TerminalApp {
     /// 把磁盘上的 CLI transcript 导入 desktop 会话并聚焦(实测 2026-09-01,
     /// 处理端是 app.asar 的 claudeURLHandler,id 校验为裸 UUID)。
     ClaudeDesktop,
-    /// Codex 桌面版(app 名叫 ChatGPT.app,bundle id com.openai.codex):
+    /// Codex 桌面版(bundle id com.openai.codex,app 名是 ChatGPT.app 或 Codex.app):
     /// codex://threads/<uuid> 打开本地会话(路由 kind "localConversation",
     /// desktop 的 threads 表与 CLI 共库、行内 rollout_path 即 CLI 文件)。
     CodexDesktop,
@@ -92,8 +92,9 @@ impl TerminalApp {
             TerminalApp::Ghostty => &["/Applications/Ghostty.app"],
             TerminalApp::Kooky => &["/Applications/Kooky.app"],
             TerminalApp::ClaudeDesktop => &["/Applications/Claude.app"],
-            // Codex desktop 的 app 名与旧版 ChatGPT 同名,靠 bundle id 区分
-            TerminalApp::CodexDesktop => &["/Applications/ChatGPT.app"],
+            // Codex desktop 的 app 名不固定:有的机器上与旧版 ChatGPT 同名(旧版改叫
+            // ChatGPT Classic),有的仍叫 Codex.app(PR #55),两个都试、靠 bundle id 区分
+            TerminalApp::CodexDesktop => &["/Applications/ChatGPT.app", "/Applications/Codex.app"],
         };
         let home = dirs::home_dir().unwrap_or_default().join("Applications");
         for c in candidates {
@@ -226,6 +227,7 @@ fn kooky_cli_path() -> Option<&'static Path> {
 /// 注册就退 0,Wake 这边看不出失败——所以名单外必须改走 kooky-cli 的哑管道。
 /// 注意 Antigravity 不在里面:kooky 的 stores 表注释写明其 CLI 数据布局未经
 /// 核实、"Absent by design"。新增 agent 时按 kooky 那张表核对,别默认落进深链
+/// (2026-10 Kilo Code 加入时核对过:kooky 不认它,走 kooky-cli)
 const KOOKY_ROSTER: &[AgentId] = &[
     AgentId::ClaudeCode,
     AgentId::Codex,

@@ -257,18 +257,18 @@ pub fn sibling_file(stem: &str) -> Option<PathBuf> {
 pub struct SetupSnippet {
     /// 客户端名("Claude Code")
     pub client: &'static str,
-    /// 对应的 agent(UI 取品牌图标用)
+    /// 对应的 agent(MCP clients 那一行的品牌图标)
     pub agent: AgentId,
     /// 怎么用这段("Run in a terminal" / "Add to ~/.codex/config.toml")
     pub hint: &'static str,
-    /// 复制按钮文案("Copy command" / "Copy config")——UI 只给按钮不展示片段
+    /// 复制钮的说明("Copy command" / "Copy config";Connect 页的复制钮只有图标,这句进 tooltip)
     pub copy_label: &'static str,
     pub text: String,
 }
 
-/// 三家客户端的接入片段(UI 的 Connect 页与 `wake-mcp setup` 同源)。路径一律
-/// 按 JSON 字符串转义——TOML basic string 与 JSON 的转义子集兼容,Windows 的
-/// 反斜杠与含空格路径都安全
+/// 三家客户端的接入片段(UI 的 Connect 页与 `wake-mcp setup` 同源)。路径一律按 JSON 字符串
+/// 引好——TOML basic string 与 JSON 的转义子集兼容,一个写法同时给 TOML 与 JSON 两种配置用,
+/// Windows 的反斜杠与含空格路径都安全
 pub fn setup_snippets(bin: &Path) -> Vec<SetupSnippet> {
     let quoted = serde_json::to_string(&bin.to_string_lossy()).unwrap_or_default();
     vec![

@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.9.1] — 2026-10-10
+
+- New: Codex gets the Wake plugin too: one command adds it to the Codex CLI and the Codex app, and every new Codex session then starts knowing where your agents left off in the project, with Wake's MCP tools to read earlier sessions. Settings → Connect shows it in place of the Codex hooks setup; if you added that hook to ~/.codex/config.toml, remove it so new sessions don't get the context twice
+- Update: The Claude Code plugin's install command in Settings → Connect downloads only the plugin, not all of Wake's source
+
+## [0.9.0] — 2026-10-10
+
+- New: New Claude Code and Codex sessions can start knowing where your agents left off in the project — the latest sessions from Claude Code, Codex, Cursor and the rest, each with its last question and reply. For Claude Code, install the Wake plugin with one command (it adds Wake's MCP tools too); Codex gets it through Codex hooks. Both are in Settings → Connect
+- Update: Wake's search index stays compact: a refresh no longer rewrites conversations that haven't changed, and the index is compacted after refreshes, so searches are faster and it takes far less disk space (one index went from 661 MB to about 160 MB)
+- Update: Copy buttons in Settings → Connect are icons now; hover one to see what it copies
+- Fix: Claude Code sessions branched from an earlier conversation no longer repeat that conversation: the copied part is folded away, the branch is listed under the session it came from, and its title, token count and start time come from what was said after the branch. When the original is deleted, in Wake or by Claude Code's own cleanup, its branches stay and show the whole conversation. Existing indexes are re-read once after upgrading
+- Fix: Search results show the text around each match, with every search term highlighted, instead of a dozen characters
+- Fix: A session you delete in Wake shows up again when you put its file back from the Trash; sessions that live in an agent's own database are now hidden from Wake instead of claiming to go to the Trash
+- Fix: A failed search, star or pin change, or a list that stops loading now says so instead of failing silently
+- Fix: The notices Claude Code adds when a background task or sub-agent finishes are no longer shown or counted as prompts you typed
+- Fix: Looking up a project's sessions from a folder that has no history of its own no longer returns sessions started in your home folder or at the filesystem root
+
+## [0.8.8] — 2026-10-09
+
+- Fix: Grok Build sessions closed before the first message no longer show up as empty Untitled sessions (#55, thanks @yangmingyuan380)
+- Fix: Open In offers Codex Desktop when the app is installed as Codex.app (#55, thanks @yangmingyuan380)
+
+## [0.8.7] — 2026-10-09
+
+- New: Kilo Code sessions are indexed — from the database the VS Code extension, the `kilo` CLI and the JetBrains plugin share (`~/.local/share/kilo/kilo.db`, read-only), and from the legacy extension's task folders in VS Code and other VS Code-based editors. Titles, models, thinking, tool calls and token counts included; legacy sub-tasks are listed under the task that started them, and a legacy task the new extension has imported is listed once. Open In continues a session with `kilo --session` in its project directory (legacy tasks have no Open In). On remote hosts only the legacy tasks are mirrored, since `kilo.db` also holds Kilo's credentials (#59, thanks @ICEY4040727)
+- New: Enlarge the whole interface to 110%, 125% or 150% with ⌘+ / ⌘− / ⌘0 (Ctrl on Linux and Windows), the new View menu, or the new Settings → Appearance page, which also takes over the light / dark choice from General; the level is remembered (#51, thanks @kyomind)
+- New: Antigravity conversations are read in full from the plain-text transcripts recent versions of the desktop app and the IDE save — messages, thinking, tool calls with their output, the model and pasted images — and conversations from the IDE carry an IDE badge. Conversations without a transcript are still listed from Antigravity's index, as before. The agent is now called Antigravity instead of Antigravity CLI (#52, thanks @iroha3)
+- Fix: OpenCode sessions show the slash command that started a sub-agent instead of an empty message, and on Windows they are grouped under the same project as other agents' sessions
+- Fix: Kimi Code sessions are listed on Windows, and sessions from the Kimi Code desktop app show the assistant's replies and thinking instead of only your prompts (#61, thanks @noohpyt)
+- Fix: Kimi Code CLI sessions show the assistant's replies, thinking and tool calls too, and background-task notifications and other system messages no longer appear as things you typed
+- Fix: Forked Kimi Code sessions are listed under the session they came from without repeating its history, archived Kimi sessions are marked archived, renaming or archiving a session in Kimi shows up in Wake right away, sessions imported from the old kimi-cli are listed, and `KIMI_CODE_HOME` is respected
+- Fix: On Windows, Cursor and Gemini CLI sessions update live again, and Claude Code sub-agent transcripts no longer flash up as empty sessions
+- Fix: A session file that can't be read (on a disconnected drive, for example) no longer stalls a refresh; Wake keeps what it already had and tries again next time. One agent whose data can't be read also no longer stops the others from refreshing
+
 ## [0.8.6] — 2026-10-01
 
 - Fix: Remote sync on Windows now accepts local cache paths with drive letters, avoiding the "source and destination cannot both be remote" error before any files transfer (#56, thanks @zhyg).

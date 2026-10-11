@@ -18,7 +18,7 @@ use wake_core::adapters::{create_adapter_roster_for, create_adapters_for, AgentA
 use wake_core::cli;
 use wake_core::db::{self, Store};
 use wake_core::mcp::tools::{self, TranscriptCache};
-use wake_core::models::SessionFilter;
+use wake_core::models::{AgentId, Role, SessionFilter, SessionMeta};
 use wake_core::scanner::{run_scan, NullEvents};
 
 mod common;
@@ -84,13 +84,17 @@ fn call(
     tools::invoke(store, adapters, &TranscriptCache::default(), tool, args)
 }
 
-/// 唯一的 spawn 实现。不要 .env_clear():子进程的 roster 全靠继承
-/// WAKE_HOME/HOME
 fn cli_raw(args: &[&str]) -> (String, String, Option<i32>) {
-    let out = Command::new(env!("CARGO_BIN_EXE_wake-cli"))
-        .args(args)
-        .output()
-        .expect("spawn wake-cli");
+    cli_raw_with(args, |_| {})
+}
+
+/// 唯一的 spawn 实现(`with` 改环境与工作目录)。不要 .env_clear():子进程的
+/// roster 全靠继承 WAKE_HOME/HOME
+fn cli_raw_with(args: &[&str], with: impl FnOnce(&mut Command)) -> (String, String, Option<i32>) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wake-cli"));
+    cmd.args(args);
+    with(&mut cmd);
+    let out = cmd.output().expect("spawn wake-cli");
     (
         String::from_utf8(out.stdout).expect("stdout is utf-8"),
         String::from_utf8(out.stderr).expect("stderr is utf-8"),
@@ -584,7 +588,7 @@ fn refresh_brings_an_existing_index_up_to_date() {
     let path = db.to_str().unwrap();
     Store::open(&db)
         .unwrap()
-        .remove_session(CLAUDE_KEY, false)
+        .remove_session(CLAUDE_KEY)
         .unwrap();
     let (_, _, code) = cli_raw(&["--db", path, "show", CLAUDE_KEY, "--messages", "1"]);
     assert_eq!(code, Some(1), "抠掉的会话按 key 该是读不出来的");
@@ -752,4 +756,225 @@ fn refresh_refuses_when_only_remote_memories_would_be_lost() {
         )
         .unwrap();
     assert_eq!(left, 1, "远程记忆不许被清掉");
+}
+
+/// `context` 给 SessionStart 钩子用:当前目录所在项目最近两周、各个 agent 停在哪(最后一问、
+/// 最后一答),子目录归到所在项目。每个 agent 先各取一条再按时间补满五条——常用的那一家
+/// 不能把别家挤出去;一句提问都没有的会话不列。认不出项目、两周内没有会话时一个字节都不
+/// 输出、退 0——钩子的输出原样进 agent 的上下文。家目录不当"所在项目":在家目录随手开的
+/// 会话不该被塞进每个新项目
+#[test]
+fn context_shows_where_each_agent_left_off_or_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = common::real_dir(tmp.path());
+    let project = home.join("app");
+    let fresh = home.join("fresh");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::create_dir_all(&fresh).unwrap();
+    let db = home.join("wake.db");
+    {
+        let store = Store::open(&db).unwrap();
+        let now = db::now_ms();
+        let write = |key: &str, at: &Path, minutes_ago: i64, turns: &[(Role, &str)]| {
+            let updated_at = now - minutes_ago * 60_000;
+            let meta = SessionMeta {
+                agent: AgentId::from_str(key.split(':').next().unwrap()).unwrap(),
+                project_path: at.to_string_lossy().into_owned(),
+                created_at: updated_at,
+                updated_at,
+                ..common::meta(key, &format!("about {key}"))
+            };
+            let units: Vec<_> = turns
+                .iter()
+                .enumerate()
+                .map(|(seq, (role, text))| common::unit(seq as i64, *role, text))
+                .collect();
+            store.write_session(&meta, updated_at, &units).unwrap();
+        };
+        // Claude Code 五条都比 Codex 那条新,只按时间挑 Codex 就进不来。每条最后一个用户单元
+        // 是 `/model` 一类命令的输出——不是人说的话,最后一问要往前找到真正的提问
+        for n in 1..=5 {
+            write(
+                &format!("claude-code:c{n}"),
+                &project,
+                n,
+                &[
+                    (Role::User, &format!("ask c{n}")),
+                    (Role::Assistant, &format!("did c{n}\nmore")),
+                    (
+                        Role::User,
+                        "<local-command-stdout>Set model to opus</local-command-stdout>",
+                    ),
+                ],
+            );
+        }
+        write(
+            "codex:review",
+            &project,
+            2 * 24 * 60,
+            &[
+                (
+                    Role::User,
+                    "<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>--base main</command-args>",
+                ),
+                (Role::Assistant, "Looks good overall"),
+                // 只有工具调用的消息:单元以换行开头,不算回复
+                (Role::Assistant, "\nBash git diff main"),
+            ],
+        );
+        // 一句提问都没有(别的 agent 代跑、刚开还没说话)
+        write("codex:silent", &project, 0, &[(Role::Assistant, "working")]);
+        write(
+            "claude-code:stale",
+            &project,
+            30 * 24 * 60,
+            &[(Role::User, "old")],
+        );
+        write("claude-code:in-home", &home, 0, &[(Role::User, "hi")]);
+    }
+    let context = |dir: &Path| {
+        let (out, _, code) = cli_raw_with(&["--db", db.to_str().unwrap(), "context"], |cmd| {
+            cmd.env("WAKE_HOME", &home).current_dir(dir);
+        });
+        (out, code)
+    };
+    let (text, code) = context(&project.join("src"));
+    assert_eq!(code, Some(0));
+    assert!(
+        text.starts_with(
+            "Wake: recent sessions in this project, across your coding agents (5 of 7 from the last 14 days):"
+        ),
+        "{text}"
+    );
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} 不在: {text}"))
+    };
+    // 按时间排:c1 最新,Codex 那条最旧
+    assert!(
+        at("`claude-code:c1`") < at("`claude-code:c4`")
+            && at("`claude-code:c4`") < at("`codex:review`")
+    );
+    assert!(
+        !text.contains("claude-code:c5"),
+        "补满五条,c5 排不上: {text}"
+    );
+    assert!(
+        text.contains("last asked: \"ask c1\"\n  last reply: \"did c1\"\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("last asked: \"/review --base main\""),
+        "slash 命令写回原样: {text}"
+    );
+    assert!(
+        text.contains("last reply: \"Looks good overall\""),
+        "工具调用不算回复: {text}"
+    );
+    assert!(!text.contains("codex:silent"), "没有提问的会话不列: {text}");
+    assert!(!text.contains("stale"), "两周以前的不列: {text}");
+    assert!(!text.contains("in-home"), "家目录的会话不跟进来: {text}");
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    for dir in [fresh.as_path(), elsewhere.path()] {
+        assert_eq!(context(dir), (String::new(), Some(0)), "{}", dir.display());
+    }
+}
+
+/// 插件只是一层壳:清单、钩子、MCP 配置都指向仓库里真实存在的脚本,钩子调的是 `wake-cli
+/// context`,启动脚本找的正是各平台打包落下二进制的地方。Claude Code 与 Codex 共用一个插件
+/// 目录,各读各的清单与市场文件。`claude plugin validate` 与 Codex 都不在 CI 里跑,这里卡住
+/// 最容易漂的几处
+#[test]
+fn the_plugins_point_at_real_files() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let json = |path: PathBuf| -> Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    };
+    // 安装命令最后一段 `<插件>@<市场>` 与市场文件对得上
+    let install_id = |market: &Value| {
+        format!(
+            "{}@{}",
+            market["plugins"][0]["name"].as_str().unwrap(),
+            market["name"].as_str().unwrap()
+        )
+    };
+    let market = json(repo.join(".claude-plugin/marketplace.json"));
+    let entry = &market["plugins"][0];
+    assert!(cli::CLAUDE_PLUGIN_INSTALL.ends_with(&install_id(&market)));
+    let plugin = repo.join(entry["source"].as_str().unwrap());
+    let manifest = json(plugin.join(".claude-plugin/plugin.json"));
+    assert_eq!(manifest["name"], entry["name"]);
+
+    // 钩子两家共用,整份钉死:Codex 按这份定义(matcher、命令、超时)认信任,改一个字所有
+    // Codex 用户的钩子就停了、要去 /hooks 重新信任——行为上的改动放进 scripts/session-start
+    assert_eq!(
+        json(plugin.join("hooks/hooks.json")),
+        json!({ "hooks": { "SessionStart": [{
+            "matcher": "startup|clear",
+            "hooks": [{
+                "type": "command",
+                "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start\"",
+                "timeout": 30
+            }]
+        }]}})
+    );
+    let start = std::fs::read_to_string(plugin.join("scripts/session-start")).unwrap();
+    assert!(start.contains("wake-cli context"), "{start}");
+
+    // MCP 两家各写一份:Claude Code 的 stdio 配置没有 cwd、插件路径靠 ${CLAUDE_PLUGIN_ROOT};
+    // Codex 不展开 MCP 参数里的变量(只展开钩子命令),写相对路径 + cwd "."(插件根,Codex
+    // 自带的插件也这么写),直接放在清单里。Codex 只给 MCP 子进程几个默认环境变量(PATH、
+    // HOME 这些),启动脚本认的 WAKE_BIN_DIR 要点名放行,不然 Wake 装在别处的人钩子能用、
+    // MCP 却找不到 wake-mcp
+    let mcp = json(plugin.join(".mcp.json"));
+    let args = &mcp["mcpServers"]["wake"]["args"];
+    assert_eq!(args[0], "${CLAUDE_PLUGIN_ROOT}/scripts/wake");
+    assert_eq!(args[1], "wake-mcp");
+    let codex_market = json(repo.join(".agents/plugins/marketplace.json"));
+    let codex_entry = &codex_market["plugins"][0];
+    assert!(cli::CODEX_PLUGIN_INSTALL.ends_with(&install_id(&codex_market)));
+    assert_eq!(
+        codex_entry["source"]["path"], entry["source"],
+        "同一个插件目录"
+    );
+    let codex_manifest = json(plugin.join(".codex-plugin/plugin.json"));
+    assert_eq!(codex_manifest["name"], codex_entry["name"]);
+    // Codex 按版本缓存装好的插件,版本不变就不重装:跟 Wake 一起走,发版改 Cargo.toml 时一并改
+    assert_eq!(codex_manifest["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        codex_manifest["mcpServers"]["wake"],
+        json!({
+            "command": "sh",
+            "args": ["./scripts/wake", "wake-mcp"],
+            "cwd": ".",
+            "env_vars": ["WAKE_BIN_DIR"]
+        })
+    );
+    for field in ["logo", "composerIcon"] {
+        let asset = codex_manifest["interface"][field].as_str().unwrap();
+        assert!(plugin.join(asset).is_file(), "{field}: {asset}");
+    }
+    // 文档里的安装命令就是 Connect 页复制的那条
+    for doc in ["README.md", "docs/cli.md", "docs/mcp.md"] {
+        let text = std::fs::read_to_string(repo.join(doc)).unwrap();
+        for command in [cli::CLAUDE_PLUGIN_INSTALL, cli::CODEX_PLUGIN_INSTALL] {
+            assert!(
+                text.contains(command),
+                "{doc} 里的安装命令过时了: {command}"
+            );
+        }
+    }
+
+    let launcher = std::fs::read_to_string(plugin.join("scripts/wake")).unwrap();
+    assert!(launcher.contains("/Applications/Wake.app/Contents/MacOS"));
+    // tar 包装进 ~/.local/bin、deb 装进 /usr/bin
+    let linux = std::fs::read_to_string(repo.join("scripts/make-linux.sh")).unwrap();
+    for dir in ["$HOME/.local/bin", "/usr/bin"] {
+        assert!(launcher.contains(dir), "启动脚本没找 {dir}");
+        assert!(
+            linux.contains(&format!("{dir}/wake-cli")),
+            "Linux 打包不再落在 {dir}"
+        );
+    }
 }

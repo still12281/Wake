@@ -26,6 +26,7 @@ use wake_core::adapters::dsh::DshAdapter;
 use wake_core::adapters::gemini::GeminiAdapter;
 use wake_core::adapters::grok::GrokAdapter;
 use wake_core::adapters::hermes::HermesAdapter;
+use wake_core::adapters::kilo::{legacy_task_key, migrated_session_id, KiloLegacyAdapter};
 use wake_core::adapters::kimi::KimiAdapter;
 use wake_core::adapters::kiro::KiroAdapter;
 use wake_core::adapters::openclaw::OpenclawAdapter;
@@ -52,6 +53,9 @@ struct TestEnv {
     cursor_ide_db: PathBuf,
     zcode_db: PathBuf,
     devin_db: PathBuf,
+    kilo_db: PathBuf,
+    kilo_tasks: PathBuf,
+    kilo_cursor_tasks: PathBuf,
     /// 假 HOME 目录本体,持有 TempDir 保证整个测试进程期间不被清理
     _home: tempfile::TempDir,
 }
@@ -73,6 +77,9 @@ fn all_memories(adapter: &Box<dyn AgentAdapter>) -> anyhow::Result<Vec<MemoryDoc
     adapter.list_memories(&adapter.memory_sources(), &[])
 }
 
+/// 共用的假 HOME:各测试只读。要写文件的测试在自己的临时目录里搭——
+/// `listed_sessions_round_trip_through_file_ref` 并行地把整个 HOME 枚举一遍,中途被改写、删掉的
+/// 文件会让列表与 file_ref 对不上,Windows 上开着的库还删不掉
 fn setup() -> &'static TestEnv {
     ENV.get_or_init(|| {
         let home = tempfile::Builder::new()
@@ -96,6 +103,9 @@ fn setup() -> &'static TestEnv {
             cursor_ide_db: sc.cursor_ide_db,
             zcode_db: sc.zcode_db,
             devin_db: sc.devin_db,
+            kilo_db: sc.kilo_db,
+            kilo_tasks: sc.kilo_tasks,
+            kilo_cursor_tasks: sc.kilo_cursor_tasks,
             _home: home,
         }
     })
@@ -122,10 +132,10 @@ fn fs_ref(agent: AgentId, path: &Path, native_id: &str) -> SessionFileRef {
 }
 
 /// 默认 roster 的实例数。**不等于 `AgentId::ALL.len()`**:Cursor 一家有两个
-/// 数据源(CLI 的 agent-transcripts 与 IDE 的 state.vscdb),各占一个实例。
-/// 新增 agent 或给某家再加数据源时,这个数跟着加一——契约要卡的是"漏了实例
-/// 就爆",而不是"每家恰好一个"
-const DEFAULT_INSTANCES: usize = AgentId::ALL.len() + 1;
+/// 数据源(CLI 的 agent-transcripts 与 IDE 的 state.vscdb),Kilo Code 也是两个
+/// (新版的 kilo.db 与旧版扩展的任务目录),各占一个实例。新增 agent 或给某家
+/// 再加数据源时,这个数跟着加一——契约要卡的是"漏了实例就爆",而不是"每家恰好一个"
+const DEFAULT_INSTANCES: usize = AgentId::ALL.len() + 2;
 
 /// SQLite 型 agent 的虚拟路径引用(`<db>#<id>`,与 sqlite_ro::virtual_path 同构)
 fn db_ref(agent: AgentId, db: &Path, id: &str) -> SessionFileRef {
@@ -366,13 +376,13 @@ fn claude_bridge_metadata_can_pass_cleanup_review() {
     use std::sync::atomic::AtomicBool;
     use wake_core::{cleanup, db::Store};
 
-    setup(); // All paths below belong to the shared synthetic home.
-    let adapter = ClaudeAdapter::new();
-    let root = adapter.data_roots().remove(0);
-    fs::create_dir_all(&root).unwrap();
+    setup();
+    // A private projects root: the shared synthetic home is read-only for tests.
     // macOS temp paths may start with the /var alias; cleanup requires real paths.
-    let root = root.canonicalize().unwrap();
-    let adapter = adapter.with_custom_root(root.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap().join("projects");
+    fs::create_dir_all(&root).unwrap();
+    let adapter = ClaudeAdapter::new().with_custom_root(root.clone());
     let project = tempfile::tempdir_in(&root).unwrap();
     let path = project.path().join("bridge-cleanup-fixture.jsonl");
     let original = fs::read_to_string(&claude_ref().file_path).unwrap();
@@ -498,6 +508,83 @@ fn claude_parse_contract() {
         .expect("claude untitled parse");
     assert_eq!(s2.meta.title, UNTITLED);
     assert_eq!(s2.meta.message_count, 1);
+}
+
+/// Claude Code 的分支会话(开头原样复制了原对话的一段):复制来的一段折成一条 Meta、分支
+/// 挂到原件下;标题、token、创建时间只算分支自己的行;自定义标题照抄原件的不当标题用。
+/// 列表与 file_ref 的引用都把"更早的同根文件有几份"计进 size,原件没了引用随之变化、
+/// 分支重解析后露出完整历史。在私有临时目录里搭(共用的假 HOME 只读)
+#[test]
+fn claude_branches_fold_the_copied_history_and_nest_under_the_original() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let (dir, a, b) = common::stage_claude_branch(&projects);
+    let adapter = ClaudeAdapter::new().with_custom_root(projects.clone());
+    let path_a = dir.join(format!("{a}.jsonl"));
+    let path_b = dir.join(format!("{b}.jsonl"));
+    let size = |p: &Path| fs::metadata(p).unwrap().len() as i64;
+
+    let listed = adapter.list_session_files().unwrap();
+    let listed_ref = |id: &str| listed.iter().find(|r| r.native_id == id).unwrap().clone();
+    let (ref_a, ref_b) = (listed_ref(&a), listed_ref(&b));
+    assert_eq!(ref_a.size, size(&path_a), "原件之前没有同根文件");
+    assert_eq!(ref_b.size, size(&path_b) + 1, "分支之前有一份同根文件");
+    let watched = adapter.file_ref(&path_b).unwrap();
+    assert_eq!(
+        (watched.mtime_ms, watched.size),
+        (ref_b.mtime_ms, ref_b.size),
+        "watcher 的引用要与列表一致"
+    );
+
+    // 原件不受影响
+    let sa = adapter.parse_session(&ref_a).unwrap();
+    assert_eq!(sa.meta.title, "修复登录超时");
+    assert_eq!(sa.meta.message_count, 4);
+    assert_eq!(sa.meta.tokens_used, Some(350));
+
+    // 分支:复制来的两条折成一条 Meta,自己的一问一答从 seq 1 起
+    let sb = adapter.parse_session(&ref_b).unwrap();
+    let tb = adapter.parse_transcript(&ref_b).unwrap();
+    assert_eq!(
+        roles_kinds(&tb.mainline),
+        vec![
+            (Role::System, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert!(tb.mainline[0]
+        .text
+        .contains("2 messages inherited from the parent session"));
+    assert_eq!(tb.mainline[1].text, "换个思路:登录改成异步队列");
+    assert_eq!(
+        sb.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
+        vec![1, 2],
+        "索引的 seq 与详情页一致,复制来的那段不进索引"
+    );
+    assert_eq!(sb.meta.message_count, 2);
+    assert_eq!(sb.meta.title, "换个思路:登录改成异步队列", "照抄的标题不用");
+    assert_eq!(sb.meta.tokens_used, Some(340), "复制来的那次调用不重复计");
+    assert_eq!(sb.meta.created_at, ms("2026-09-02T09:00:10Z"));
+
+    assert_eq!(
+        adapter.parent_links(),
+        Some(vec![(
+            format!("claude-code:{b}"),
+            format!("claude-code:{a}")
+        )])
+    );
+
+    // 原件被删(Claude 的 cleanupPeriodDays):引用变了,分支露出完整历史、自己也不再是子会话
+    fs::remove_file(&path_a).unwrap();
+    let listed = adapter.list_session_files().unwrap();
+    let ref_b = listed.iter().find(|r| r.native_id == b).unwrap().clone();
+    assert_eq!(ref_b.size, size(&path_b));
+    let sb = adapter.parse_session(&ref_b).unwrap();
+    assert_eq!(sb.meta.message_count, 4);
+    assert_eq!(sb.meta.title, "修复登录超时");
+    assert_eq!(sb.meta.tokens_used, Some(460));
+    assert_eq!(adapter.parent_links(), Some(Vec::new()));
 }
 
 #[test]
@@ -1890,6 +1977,61 @@ fn grok_parse_contract() {
     );
 }
 
+/// 没发过消息就关掉的 Grok 会话只剩插件钩子之类的流水,不列(PR #55)。判据与解析器是
+/// 同一个分类:只有思考、只有工具调用的会话照列,列出来的都解析得出消息,空壳一条都没有。
+/// 钩子行的真实格式还没见过样本,这里只要它不是会起消息的更新;current_mode_update 是
+/// 认得的非内容更新
+#[test]
+fn grok_skips_sessions_without_content() {
+    use serde_json::json;
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let cwd = home
+        .path()
+        .join("sessions")
+        .join("%2FUsers%2Ftester%2FGithub%2Fwakefx");
+    fs::create_dir_all(&cwd).unwrap();
+    // 根在构造时按目录形状定下,sessions/ 得先在
+    let adapter = GrokAdapter::new().with_custom_root(home.path().to_path_buf());
+    let text =
+        |kind: &str| json!({"sessionUpdate": kind, "content": {"type": "text", "text": "看看"}});
+    let hook = json!({"sessionUpdate": "hook_execution", "hook": "session_start"});
+    let mode = json!({"sessionUpdate": "current_mode_update", "currentModeId": "default"});
+    for (id, updates, listed) in [
+        ("shell", vec![hook.clone(), mode.clone()], false),
+        ("thought", vec![text("agent_thought_chunk")], true),
+        (
+            "tool",
+            vec![json!({"sessionUpdate": "tool_call", "title": "Grep"})],
+            true,
+        ),
+        ("chat", vec![hook, mode, text("user_message_chunk")], true),
+    ] {
+        let dir = cwd.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("updates.jsonl");
+        let body: String = updates
+            .iter()
+            .map(|update| format!("{}\n", json!({"params": {"update": update}})))
+            .collect();
+        fs::write(&path, body).unwrap();
+        // 列表与监听都只经 file_ref
+        assert_eq!(adapter.file_ref(&path).is_some(), listed, "{id}");
+        let parsed = adapter
+            .parse_session(&fs_ref(AgentId::Grok, &path, id))
+            .unwrap();
+        assert_eq!(parsed.meta.message_count > 0, listed, "{id}");
+    }
+    let mut ids: Vec<String> = adapter
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["chat", "thought", "tool"]);
+}
+
 #[test]
 fn kimi_parse_contract() {
     setup();
@@ -1940,6 +2082,209 @@ fn kimi_parse_contract() {
     assert_eq!(s2.meta.title, "占位标题会话应回退到这句");
 }
 
+/// Kimi Code 桌面端(0.4x)的 wire(PR #61):助手回复在 agent.message.appended,包装层
+/// `{message, meta}`;一次模型调用一条事件、多半只有 think,同一轮连续的助手事件并成
+/// 一条回复(turn.step.* 不分割),think 进 thinking;新的一轮另起一条,哪怕那一轮的输入
+/// 渲染不出来(只带视频)、没有用户消息隔开。user 角色与 turn.prompt 重复、跳过,tool 角色
+/// 回填到调用上,不认识的角色与缺包装层都计未知行;每行带事件时间。列表走 list_session_files——主代理的 wire.jsonl 按路径分段
+/// 认,原先按字符串比 `/agents/main/wire.jsonl`,Windows 的反斜杠路径一条都列不出来;
+/// Kimi 在 Windows 上记的 `c:/…` 工作目录换成别家同款写法
+#[test]
+fn kimi_desktop_wire_contract() {
+    setup();
+    let session_id = "session_77777777-aaaa-bbbb-cccc-000000000007";
+    let adapter = KimiAdapter::new().with_custom_root(fixture("kimi-desktop"));
+    let refs = adapter.list_session_files().expect("kimi list");
+    assert_eq!(
+        refs.iter()
+            .map(|r| r.native_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![session_id]
+    );
+    let r = &refs[0];
+    // 子代理的 wire.jsonl(文件确实在)按路径分段拒掉
+    let agents = Path::new(&r.file_path).parent().unwrap().parent().unwrap();
+    let sub = agents.join("sub-1").join("wire.jsonl");
+    assert!(sub.is_file());
+    assert!(adapter.file_ref(&sub).is_none());
+
+    let t = adapter
+        .parse_transcript(r)
+        .expect("kimi desktop transcript");
+    assert_eq!(
+        roles_kinds(&t.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    let reply = &t.mainline[1];
+    assert_eq!(reply.text, "QrScanner 的 useEffect 少了清理回调,已补上。");
+    assert_eq!(
+        reply.thinking.as_deref(),
+        Some("先看 QrScanner 的 useEffect\n\n找到了:没有返回清理函数")
+    );
+    assert_eq!(t.mainline[0].timestamp, Some(ms("2026-10-08T00:00:01Z")));
+    assert_eq!(reply.timestamp, Some(ms("2026-10-08T00:00:02Z")));
+    assert_eq!(t.mainline[2].text, "谢谢");
+    assert_eq!(t.mainline[3].text, "不客气。");
+    // 只带视频的那一轮:回复另起一条,不并进上一轮的「不客气。」;同一轮的两步并成一条
+    assert_eq!(t.mainline[4].text, "视频里的按钮错位了。\n\n已经对齐。");
+    assert_eq!(t.mainline[4].timestamp, Some(ms("2026-10-08T00:00:21Z")));
+    // 缺包装层的一行 + 不认识的角色一行
+    assert_eq!(t.unknown_line_count, 2);
+
+    let s = adapter.parse_session(r).expect("kimi desktop session");
+    assert_eq!(s.meta.title, "Kimi 修一下 QrScanner 的 useEffect 内存泄漏");
+    let project = if cfg!(windows) {
+        r"C:\Users\tester\Github\wakefx"
+    } else {
+        "C:/Users/tester/Github/wakefx"
+    };
+    assert_eq!(s.meta.project_path, project);
+    assert_eq!(s.meta.project_name, "wakefx");
+    assert_eq!(s.meta.message_count, 5);
+    assert_seq_contract(adapter.as_ref(), r);
+}
+
+/// Kimi Code CLI(agent-core 0.29)的真实记录流(合成 fixture,形状照 Kimi 自己的
+/// `reduceWireRecords`):助手回复按步写在 context.append_loop_event(think / text 块、
+/// tool.call 与 tool.result),同一轮的各步并成一条、工具结果回填;用户输入的
+/// context.append_message 回声跳过,只带视频的输入渲染不出来时由回声顶上;后台任务通知
+/// 这类系统产生的输入记 Meta,注入与目标续跑不显示;压缩摘要单独一条;不认识的 origin 与
+/// 记录类型计未知行。另有分叉会话(forked 之前折成一条、挂回父会话、已归档)与从旧版
+/// kimi-cli 迁移来的 `ses_` 会话(只有 context.append_message、没有时间)
+#[test]
+fn kimi_cli_wire_contract() {
+    setup();
+    let main_id = "session_c1111111-aaaa-bbbb-cccc-000000000001";
+    let fork_id = "session_c2222222-aaaa-bbbb-cccc-000000000002";
+    let migrated_id = "ses_c3333333-aaaa-bbbb-cccc-000000000003";
+    let adapter = KimiAdapter::new().with_custom_root(fixture("kimi-cli"));
+    let refs: std::collections::HashMap<String, SessionFileRef> = adapter
+        .list_session_files()
+        .expect("kimi list")
+        .into_iter()
+        .map(|r| (r.native_id.clone(), r))
+        .collect();
+    let mut ids: Vec<&str> = refs.keys().map(String::as_str).collect();
+    ids.sort();
+    assert_eq!(ids, vec![migrated_id, main_id, fork_id]);
+
+    let r = &refs[main_id];
+    let t = adapter.parse_transcript(r).expect("kimi cli transcript");
+    assert_eq!(
+        roles_kinds(&t.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::User, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::System, MessageKind::CompactSummary),
+            (Role::User, MessageKind::Meta),
+        ]
+    );
+    let m = &t.mainline;
+    assert_eq!(m[0].text, "QrScanner 的 useEffect 有内存泄漏,修一下");
+    assert_eq!(m[0].timestamp, Some(ms("2026-10-08T00:00:01Z")));
+    // 两步并成一条:think 进 thinking,工具结果回填到调用上
+    assert_eq!(m[1].text, "我先看看 QrScanner。\n\n缺了清理回调,已补上。");
+    assert_eq!(m[1].thinking.as_deref(), Some("先读 QrScanner"));
+    let calls: Vec<(&str, &str, bool)> = m[1]
+        .tool_calls
+        .iter()
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.output.as_deref().unwrap_or(""),
+                c.is_error,
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(
+            "ReadFile",
+            "useEffect(() => { scanner.start() }, [])",
+            false
+        )]
+    );
+    assert!(m[2].text.starts_with("<notification"));
+    // 只带视频的输入渲染不出来:由进上下文的那份回声顶上
+    assert_eq!(m[3].text, "<video path=\"/tmp/demo.mp4\"></video>");
+    assert_eq!(m[4].text, "视频里按钮错位了。");
+    assert_eq!(m[4].tool_calls[0].output.as_deref(), Some("1 failing"));
+    assert!(m[4].tool_calls[0].is_error);
+    assert!(m[5].text.contains("QrScanner 的内存泄漏"));
+    assert_eq!(m[6].text, "来源不认识的输入");
+    // 不认识的 origin 一次 + 不认识的记录类型一次;用量、请求快照、权限等都认得
+    assert_eq!(t.unknown_line_count, 2);
+    let s = adapter.parse_session(r).expect("kimi cli session");
+    assert_eq!(s.meta.title, "修 QrScanner 泄漏");
+    assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
+    assert_eq!(s.meta.message_count, 4);
+    assert!(!s.meta.archived);
+    assert_seq_contract(adapter.as_ref(), r);
+
+    // 分叉:forked 之前从父会话复制来的那段折成一条;state.json 的 archived 照搬
+    let fork = adapter
+        .parse_transcript(&refs[fork_id])
+        .expect("kimi fork transcript");
+    assert_eq!(
+        roles_kinds(&fork.mainline),
+        vec![
+            (Role::System, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert!(fork.mainline[0]
+        .text
+        .contains("2 messages inherited from the parent session"));
+    assert_eq!(fork.mainline[2].text, "已抽成 useQrScanner。");
+    assert!(fork.meta.archived);
+    assert_eq!(
+        adapter.parent_links(),
+        Some(vec![(format!("kimi:{fork_id}"), format!("kimi:{main_id}"))])
+    );
+
+    // 迁移来的会话:没有 turn 记录,用户消息来自 context.append_message
+    let migrated = adapter
+        .parse_transcript(&refs[migrated_id])
+        .expect("kimi migrated transcript");
+    assert_eq!(
+        roles_kinds(&migrated.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert_eq!(
+        migrated.mainline[1].text,
+        "我来查一下。\n\n目录里只有 README。"
+    );
+    assert_eq!(
+        migrated.mainline[1].tool_calls[0].output.as_deref(),
+        Some("README.md")
+    );
+    assert_eq!(migrated.unknown_line_count, 0);
+
+    // 自定义 location 只选到某个 wd_* 工作目录桶:会话照样列得出,工作目录照样查得到
+    let bucket = KimiAdapter::new()
+        .with_custom_root(fixture("kimi-cli").join("sessions").join("wd_wakefx_cli1"));
+    let listed = bucket.list_session_files().expect("kimi bucket list");
+    assert_eq!(listed.len(), 3);
+    let one = listed.iter().find(|r| r.native_id == main_id).unwrap();
+    assert_eq!(
+        bucket.parse_session(one).unwrap().meta.project_path,
+        "/Users/tester/Github/wakefx"
+    );
+}
+
 #[test]
 fn antigravity_parse_contract() {
     let env = setup();
@@ -1975,6 +2320,200 @@ fn antigravity_parse_contract() {
     assert!(t.mainline[0].text.contains("encrypted"));
     assert_eq!(s.units.len(), 1);
     assert!(s.units[0].text.contains("QR overlay polish"));
+}
+
+/// 新版本写下的明文转录(PR #52 整理的格式,合成 fixture):转录与索引卡片都如实列出,
+/// 同一个 id 由 dedup_rank 让转录胜出;索引里的子会话两种都不列
+#[test]
+fn antigravity_transcripts_replace_index_cards() {
+    use common::AgIndexRow;
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let gemini = tmp.path().join(".gemini");
+    let db = common::build_antigravity_index(
+        &gemini,
+        &[
+            AgIndexRow {
+                id: "ag-1",
+                preview: "Dashboard buttons",
+                workspace: "/Users/tester/Github/dashboard",
+                app: "antigravity-ide",
+                ..Default::default()
+            },
+            AgIndexRow {
+                id: "ag-2",
+                preview: "Card only conversation",
+                workspace: "/Users/tester/Github/wakefx",
+                app: "antigravity",
+                ..Default::default()
+            },
+            AgIndexRow {
+                id: "ag-3",
+                preview: "Spawned helper",
+                workspace: "/Users/tester/Github/dashboard",
+                parent: "ag-1",
+                app: "antigravity-ide",
+            },
+        ],
+    );
+    let ide = gemini.join("antigravity-ide").join("brain");
+    let desktop = gemini.join("antigravity").join("brain");
+    let asked = ms("2026-08-30T02:11:10Z");
+    // 第一张贴图在第一轮之后几秒;第二张离哪一轮都差出两个小时,不挂
+    let t1 =
+        common::stage_antigravity_transcript(&ide, "ag-1", &[asked + 3_000, asked + 2 * 3_600_000]);
+    // 指到会话目录外面的贴图(远程镜像原样保留符号链接)不读
+    #[cfg(unix)]
+    {
+        let outside = tmp.path().join("outside.png");
+        fs::write(&outside, b"\x89PNG\r\n\x1a\noutside").unwrap();
+        let uploads = ide.join("ag-1").join(".user_uploaded");
+        std::os::unix::fs::symlink(
+            &outside,
+            uploads.join(format!("media_{}.png", asked + 5_000)),
+        )
+        .unwrap();
+    }
+    let t3 = common::stage_antigravity_transcript(&ide, "ag-3", &[]);
+    let t4 = common::stage_antigravity_transcript(&desktop, "ag-4", &[]);
+    // brain 根下不是会话的目录(浏览器子代理的临时录屏)
+    fs::create_dir_all(desktop.join("tempmediaStorage")).unwrap();
+
+    let adapter = AntigravityAdapter::new().with_custom_root(gemini.clone());
+    assert_eq!(
+        adapter.data_roots(),
+        vec![db.clone(), desktop.clone(), ide.clone()]
+    );
+    let mut refs = adapter.list_session_files().expect("antigravity list");
+    refs.sort_by(|a, b| (&a.native_id, &a.file_path).cmp(&(&b.native_id, &b.file_path)));
+    let card = |id: &str| format!("{}#{id}", db.display());
+    let listed: Vec<(&str, String)> = refs
+        .iter()
+        .map(|r| (r.native_id.as_str(), r.file_path.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            ("ag-1", card("ag-1")),
+            ("ag-1", t1.to_string_lossy().to_string()),
+            ("ag-2", card("ag-2")),
+            ("ag-4", t4.to_string_lossy().to_string()),
+        ]
+    );
+    // 同一个 id 的卡片与转录同时出现时,转录胜出
+    assert_eq!(adapter.dedup_rank(&refs[1].file_path), 0);
+    assert_eq!(adapter.dedup_rank(&refs[0].file_path), 1);
+
+    let r = &refs[1];
+    let s = adapter.parse_session(r).expect("ag-1 parse_session");
+    let t = adapter.parse_transcript(r).expect("ag-1 parse_transcript");
+    assert_eq!(s.meta.key, "antigravity:ag-1");
+    // 索引没起标题(title 列空),第一轮请求压过 preview
+    assert_eq!(s.meta.title, "Fix the button layout on the dashboard");
+    assert_eq!(s.meta.project_path, "/Users/tester/Github/dashboard");
+    assert_eq!(s.meta.source.as_deref(), Some("IDE"));
+    assert_eq!(s.meta.model.as_deref(), Some("Gemini 3.7 Flash (High)"));
+    assert_eq!(s.meta.created_at, asked);
+    assert_eq!(s.meta.updated_at, ms("2026-08-30T02:12:06Z"));
+    assert_eq!(t.unknown_line_count, 1);
+    assert_eq!(
+        roles_kinds(&t.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::System, MessageKind::CompactSummary),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    let answer = &t.mainline[1];
+    assert!(answer.text.contains("updated the button alignment"));
+    assert!(answer
+        .thinking
+        .as_deref()
+        .is_some_and(|thinking| thinking.contains("find where the buttons")));
+    // 一轮里的两步并成一条;工具结果按调用顺序回填
+    let tools: Vec<(&str, &str)> = answer
+        .tool_calls
+        .iter()
+        .map(|call| (call.name.as_str(), call.output.as_deref().unwrap_or("")))
+        .collect();
+    assert_eq!(
+        tools,
+        vec![
+            ("view_file", "pub fn render_buttons() {}"),
+            ("grep_search", "src/ui.rs:12: pub fn render_buttons() {}"),
+            ("run_command", "test result: ok. 5 passed"),
+        ]
+    );
+    assert_eq!(answer.tool_calls[0].input_preview, "View ui.rs");
+    // 装在 JSON 字符串里的参数也解开
+    assert_eq!(answer.tool_calls[1].input_preview, "render_buttons");
+    assert!(answer.tool_calls[1]
+        .input
+        .as_deref()
+        .is_some_and(|input| input.contains("\"SearchPath\"")));
+    // 贴图只在详情页解码,挂在正文末尾
+    let asked_msg = &t.mainline[0];
+    assert_eq!(asked_msg.images.len(), 1);
+    assert_eq!(asked_msg.images[0].media_type, "image/png");
+    assert_eq!(asked_msg.images[0].text_offset, asked_msg.text.len());
+    assert!(t.mainline[3].images.is_empty());
+    assert_seq_contract(adapter.as_ref(), r);
+
+    // 卡片:preview 作标题,正文是加密说明;同一会话转录读不出时就是它
+    let card1 = adapter.parse_transcript(&refs[0]).expect("ag-1 card");
+    assert_eq!(card1.meta.title, "Dashboard buttons");
+    assert_eq!(card1.meta.source.as_deref(), Some("IDE"));
+    let card2 = adapter.parse_transcript(&refs[2]).expect("ag-2 card");
+    assert_eq!(card2.meta.title, "Card only conversation");
+    assert_eq!(card2.meta.source, None);
+    assert!(card2.mainline[0].text.contains("encrypted"));
+
+    // 没进索引的会话:工作区取工具的工作目录,桌面端不挂 via
+    let s4 = adapter.parse_session(&refs[3]).expect("ag-4 parse_session");
+    assert_eq!(s4.meta.project_path, "/Users/tester/Github/wakefx");
+    assert_eq!(s4.meta.source, None);
+    assert_eq!(s4.meta.title, "Fix the button layout on the dashboard");
+
+    // watcher 入口与列表同一个判据(含索引那一行算进的指纹)
+    let watched = adapter.file_ref(&t1).expect("ag-1 转录");
+    assert_eq!(
+        (watched.native_id.as_str(), watched.mtime_ms, watched.size),
+        ("ag-1", r.mtime_ms, r.size)
+    );
+    assert!(adapter.file_ref(&t3).is_none(), "子会话不列");
+    // 转录会话整个目录进废纸篓,卡片只记墓碑
+    assert_eq!(
+        adapter.session_paths(&s.meta),
+        vec![ide.join("ag-1").to_string_lossy().to_string()]
+    );
+    assert_eq!(adapter.cleanup_paths(&card2.meta), None);
+
+    // 一条消息都读不出的转录算解析失败(scanner 据此退回同一会话的卡片)
+    let broken = common::stage_antigravity_transcript(&desktop, "ag-5", &[]);
+    fs::write(&broken, "{\"type\":\"USER_INPUT\",\"content\":\"trunc").unwrap();
+    let broken_ref = adapter.file_ref(&broken).expect("ag-5 转录");
+    assert!(adapter.parse_session(&broken_ref).is_err());
+
+    // 索引库删掉了:卡片不再列,不交回上一次读到的
+    fs::remove_file(&db).unwrap();
+    let after: Vec<String> = adapter
+        .list_session_files()
+        .expect("antigravity list without index")
+        .into_iter()
+        .map(|r| r.file_path)
+        .collect();
+    assert!(
+        after.iter().all(|path| path.ends_with("transcript.jsonl")),
+        "{after:?}"
+    );
+
+    // 自定义 location 的其余形状:单个 brain、app 数据目录、索引所在目录
+    let roots = |dir: PathBuf| AntigravityAdapter::new().with_custom_root(dir).data_roots();
+    assert_eq!(roots(ide.clone()), vec![ide.clone()]);
+    assert_eq!(roots(gemini.join("antigravity-ide")), vec![ide.clone()]);
+    assert_eq!(roots(gemini.join("antigravity-cli")), vec![db.clone()]);
 }
 
 // ---------------------------------------------------------------- seq 契约
@@ -2029,8 +2568,13 @@ fn watch_paths_derive_from_data_roots() {
     for a in wake_core::adapters::create_adapters() {
         let tag = a.agent().as_str();
         let watched = a.watch_paths();
-        let expect: Vec<std::path::PathBuf> =
-            a.data_roots().into_iter().filter(|p| p.is_dir()).collect();
+        // 唯一的例外:Kilo 旧版扩展的任务目录不进监听(每个任务里一整份 checkpoints 影子
+        // git 仓库,见 adapters::kilo);它的新版实例是库文件,本来就没有监听目录
+        let expect: Vec<std::path::PathBuf> = if a.agent() == AgentId::Kilo {
+            Vec::new()
+        } else {
+            a.data_roots().into_iter().filter(|p| p.is_dir()).collect()
+        };
         assert_eq!(
             watched, expect,
             "[{tag}] watch_paths 必须等于 data_roots 的现存目录子集"
@@ -2077,6 +2621,48 @@ fn overlapping_watch_roots_dispatch_to_deepest() {
     );
 }
 
+/// 列会话与 file_ref(watcher 的入口)必须是同一个判据。假 HOME 是 copy_tree 拷出来的,路径
+/// 用本平台的分隔符,所以 Windows CI 上这里跑的就是反斜杠路径——拿写死 `/` 的字符串比路径的
+/// file_ref 在那里一条都对不上:会话只在全量扫描时出现,实时更新全丢(Kimi 在 PR #61 之前
+/// 在 Windows 上连列都列不出来,Cursor / Gemini 的实时更新、Claude 的子代理过滤同病)。
+/// 只看真实文件:SQLite 型的 `<db>#<id>` 虚拟路径不走 watcher
+#[test]
+fn listed_sessions_round_trip_through_file_ref() {
+    setup();
+    for adapter in wake_core::adapters::create_adapters() {
+        let tag = adapter.agent().as_str();
+        for r in adapter.list_session_files().unwrap_or_default() {
+            let path = Path::new(&r.file_path);
+            if !path.is_file() {
+                continue;
+            }
+            let back = adapter
+                .file_ref(path)
+                .unwrap_or_else(|| panic!("[{tag}] file_ref 不认列表里的 {}", r.file_path));
+            assert_eq!(back.native_id, r.native_id, "[{tag}] {}", r.file_path);
+            // 戳也得一样:边车并进引用的家,两条路算出来的不一样,增量与全量就互相判脏
+            assert_eq!(
+                (back.mtime_ms, back.size),
+                (r.mtime_ms, r.size),
+                "[{tag}] {}",
+                r.file_path
+            );
+        }
+    }
+    // 反过来:子代理转录(文件确实在)不是会话,按所在目录拒掉。逐段 join,Windows 上同样是
+    // 反斜杠路径
+    let mut sub = fixture("claude");
+    sub.extend([
+        "projects",
+        "-Users-tester-Github-wakefx",
+        "11111111-aaaa-bbbb-cccc-000000000001",
+        "subagents",
+        "agent-fixture01.jsonl",
+    ]);
+    assert!(sub.is_file());
+    assert!(ClaudeAdapter::new().file_ref(&sub).is_none());
+}
+
 #[test]
 fn data_roots_contract() {
     // roster 覆盖契约:create_adapters 返回全量各家(不按 detect 过滤,
@@ -2106,7 +2692,7 @@ fn data_roots_contract() {
         .filter(|a| a.detect())
         .map(|a| a.agent().as_str())
         .collect();
-    for expect in ["copilot", "opencode", "antigravity", "dsh"] {
+    for expect in ["copilot", "opencode", "antigravity", "dsh", "kilo"] {
         assert!(
             detected.contains(&expect),
             "{expect} 应被检出,实际 {detected:?}"
@@ -2164,8 +2750,11 @@ fn dsh_parse_contract() {
     assert_eq!(listed[0].native_id, "dsh-e2e4-0001");
 
     // 压缩配置换挡会两后缀并存:陈旧的一份在 file_ref 就让位(裁决单点,
-    // watcher 入口同样受保护,不会把旧文件当主文件解析)
-    let stale = env.dsh_log.with_file_name("session.jsonl");
+    // watcher 入口同样受保护,不会把旧文件当主文件解析)。在私有拷贝里摆
+    let copy = tempfile::tempdir().unwrap();
+    let main = copy.path().join(env.dsh_log.file_name().unwrap());
+    fs::copy(&env.dsh_log, &main).unwrap();
+    let stale = main.with_file_name("session.jsonl");
     fs::write(&stale, "{\"type\":\"session\",\"version\":0,\"id\":\"dsh-e2e4-0001\",\"createdAt\":1786000000000,\"cwd\":\"/Users/tester/Github/wakefx\",\"delegationDepth\":0}\n")
         .expect("write stale sibling");
     let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
@@ -2175,11 +2764,7 @@ fn dsh_parse_contract() {
         .and_then(|f| f.set_modified(hour_ago))
         .expect("age stale sibling");
     assert!(adapter.file_ref(&stale).is_none(), "陈旧 sibling 应让位");
-    assert!(
-        adapter.file_ref(&env.dsh_log).is_some(),
-        "较新主文件不受影响"
-    );
-    fs::remove_file(&stale).expect("remove stale sibling");
+    assert!(adapter.file_ref(&main).is_some(), "较新主文件不受影响");
 
     let s = adapter.parse_session(&r).expect("dsh parse_session");
     let t = adapter.parse_transcript(&r).expect("dsh parse_transcript");
@@ -2440,6 +3025,30 @@ fn seq_contract_holds_for_all_agents() {
         (
             Box::new(DevinAdapter::new()),
             db_ref(AgentId::Devin, &env.devin_db, "dv-0002"),
+        ),
+        (
+            Box::new(OpencodeAdapter::kilo()),
+            db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0001"),
+        ),
+        (
+            Box::new(OpencodeAdapter::kilo()),
+            db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0002"),
+        ),
+        (
+            Box::new(OpencodeAdapter::kilo()),
+            db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0005"),
+        ),
+        (
+            Box::new(KiloLegacyAdapter::new()),
+            kilo_task_ref(&env.kilo_tasks, KILO_T1),
+        ),
+        (
+            Box::new(KiloLegacyAdapter::new()),
+            kilo_task_ref(&env.kilo_tasks, KILO_T2),
+        ),
+        (
+            Box::new(KiloLegacyAdapter::new()),
+            kilo_task_ref(&env.kilo_tasks, KILO_T3),
         ),
     ];
     for (adapter, r) in &checks {
@@ -3173,6 +3782,478 @@ fn devin_custom_root_normalization() {
     assert_eq!(adapter.data_roots(), vec![lone]);
 }
 
+// ---------------------------------------------------------------- Kilo Code
+
+const KILO_T1: &str = "1736400000000";
+const KILO_T2: &str = "01944f77-3500-7abc-8def-0123456789ab";
+const KILO_T3: &str = "01944f78-bba0-7abc-8def-0123456789ac";
+
+/// 旧版任务的引用:native id 是新版扩展导入它时给的 `ses_migrated_…`
+fn kilo_task_ref(tasks: &Path, task_id: &str) -> SessionFileRef {
+    fs_ref(
+        AgentId::Kilo,
+        &tasks.join(task_id).join("api_conversation_history.json"),
+        &migrated_session_id(task_id),
+    )
+}
+
+#[test]
+fn kilo_parse_contract() {
+    let env = setup();
+    let kilo = OpencodeAdapter::kilo();
+    assert_eq!(kilo.agent(), AgentId::Kilo);
+    assert_eq!(kilo.data_roots(), vec![env.kilo_db.clone()]);
+    let refs = kilo.list_session_files().unwrap();
+    let ids: Vec<&str> = refs.iter().map(|r| r.native_id.as_str()).collect();
+    let migrated = migrated_session_id("migrated-task-0004");
+    for id in [
+        "ses_kilo_0001",
+        "ses_kilo_0002",
+        "ses_kilo_0004",
+        "ses_kilo_0005",
+        migrated.as_str(),
+    ] {
+        assert!(ids.contains(&id), "{id} 应列出: {ids:?}");
+    }
+    assert!(!ids.contains(&"ses_kilo_0003"), "子代理会话不列");
+    assert!(!ids.contains(&"ses_kilo_0006"), "没有正文的会话不列");
+    assert!(refs.iter().all(|r| r.agent == AgentId::Kilo));
+
+    // 正文在 message + part;实验开关双写的那条 shell 记录不能把它换成 v2 路径
+    let r1 = db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0001");
+    let p = kilo.parse_session(&r1).unwrap();
+    assert_eq!(p.meta.key, "kilo:ses_kilo_0001");
+    assert_eq!(p.meta.agent, AgentId::Kilo);
+    assert_eq!(p.meta.title, "Kilo 二维码泄漏排查");
+    assert_eq!(p.meta.project_path, "/Users/tester/Github/wakefx");
+    assert_eq!(p.meta.model.as_deref(), Some("kilo-auto/free"));
+    assert_eq!(p.meta.tokens_used, Some(150));
+    assert_eq!(p.meta.source, None, "opencode2 徽章是 OpenCode 自己的");
+    assert!(!p.meta.archived);
+    assert_eq!(p.unknown_line_count, 0, "agent / retry 是已知的 part");
+    let t = kilo.parse_transcript(&r1).unwrap();
+    assert_eq!(
+        roles_kinds(&t.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text)
+        ]
+    );
+    assert!(t.mainline[0].text.contains("useEffect()"));
+    let reply = &t.mainline[1];
+    assert_eq!(reply.text, "找到了:卸载时没有停止扫描。");
+    assert_eq!(reply.thinking.as_deref(), Some("先看清理函数"));
+    assert_eq!(reply.tool_calls.len(), 1);
+    assert_eq!(reply.tool_calls[0].name, "grep");
+    assert!(
+        !t.mainline.iter().any(|m| m.text.contains("pnpm test")),
+        "双写的 shell 记录不该顶掉正文"
+    );
+
+    // 用户敲命令派子代理:消息里只有 subtask 块,照用户敲的写回;compaction 标记那条
+    // 用户消息没有内容
+    let t2 = kilo
+        .parse_transcript(&db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0002"))
+        .unwrap();
+    assert_eq!(
+        roles_kinds(&t2.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text)
+        ]
+    );
+    assert_eq!(t2.mainline[0].text, "/review");
+    assert_eq!(t2.unknown_line_count, 0);
+
+    // 归档与只有 session_message 的会话
+    let archived = kilo
+        .parse_session(&db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0004"))
+        .unwrap();
+    assert!(archived.meta.archived);
+    let v2 = kilo
+        .parse_transcript(&db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0005"))
+        .unwrap();
+    assert_eq!(
+        roles_kinds(&v2.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text)
+        ]
+    );
+    assert_eq!(v2.mainline[1].text, "v2 回答");
+}
+
+#[test]
+fn kilo_legacy_parse_contract() {
+    let env = setup();
+    let legacy = KiloLegacyAdapter::new();
+    assert_eq!(legacy.agent(), AgentId::Kilo);
+    let roots = legacy.data_roots();
+    assert_eq!(roots[0], env.kilo_tasks, "VS Code 那条恒在、在最前");
+    assert!(
+        roots.contains(&env.kilo_cursor_tasks),
+        "装过旧版的 Cursor 也要收: {roots:?}"
+    );
+    let mut ids: Vec<String> = legacy
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    ids.sort();
+    let mut expect: Vec<String> = [
+        KILO_T1,
+        KILO_T2,
+        KILO_T3,
+        "migrated-task-0004",
+        "cursor-task-0007",
+    ]
+    .iter()
+    .map(|t| migrated_session_id(t))
+    .collect();
+    expect.sort();
+    assert_eq!(ids, expect, "只有界面回放的、空数组的任务不算会话");
+
+    // T1:XML 工具协议时代,没有 history_item.json
+    let r1 = kilo_task_ref(&env.kilo_tasks, KILO_T1);
+    let p1 = legacy.parse_session(&r1).unwrap();
+    assert_eq!(p1.meta.key, legacy_task_key(KILO_T1));
+    assert_eq!(
+        p1.meta.title, "修复二维码扫描的内存泄漏",
+        "_index.json 压过 globalState 里停住的旧表"
+    );
+    assert_eq!(p1.meta.project_path, "/Users/tester/Github/wakefx");
+    assert_eq!(p1.meta.tokens_used, Some(150));
+    assert_eq!(p1.meta.source.as_deref(), Some("VS Code"));
+    assert_eq!(
+        p1.meta.created_at, 1_736_400_000_000,
+        "数字 id 就是创建时刻"
+    );
+    assert_eq!(p1.meta.updated_at, 1_736_400_006_000);
+    let t1 = legacy.parse_transcript(&r1).unwrap();
+    assert_eq!(
+        roles_kinds(&t1.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::System, MessageKind::Meta),
+            (Role::Assistant, MessageKind::Text),
+            (Role::System, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert_eq!(t1.mainline[0].text, "修复二维码扫描的内存泄漏");
+    assert_eq!(
+        t1.mainline[1].thinking.as_deref(),
+        Some("先看看组件里的 useEffect")
+    );
+    assert!(
+        t1.mainline[2].text.contains("scanner.watch()")
+            && t1.mainline[2].text.contains("not a user message"),
+        "XML 工具结果的本体跟着抬头折叠,不是用户说的话"
+    );
+    assert!(
+        !t1.mainline
+            .iter()
+            .any(|m| m.role == Role::User && m.text.contains("not a user message")),
+        "读到的文件里恰好有 <task> 标签,不算用户的话"
+    );
+    assert_eq!(
+        t1.mainline[3].text,
+        "清理函数里没有停止扫描。\n\n已修复:组件卸载时停止扫描。"
+    );
+    assert_eq!(t1.mainline[5].text, "再加一个回归测试");
+    assert!(
+        !t1.mainline
+            .iter()
+            .any(|m| m.text.contains("environment_details")),
+        "编辑器快照不进转录"
+    );
+    assert_eq!(t1.unknown_line_count, 0);
+
+    // T2:原生工具调用,history_item.json 给标题 / 工作区 / token
+    let r2 = kilo_task_ref(&env.kilo_tasks, KILO_T2);
+    let p2 = legacy.parse_session(&r2).unwrap();
+    assert_eq!(p2.meta.title, "Kilo 旧版:给二维码组件加单元测试");
+    assert_eq!(
+        p2.meta.project_path, "/Users/tester/Github/wakefx",
+        "history_item 压过编辑器快照"
+    );
+    assert_eq!(p2.meta.tokens_used, Some(1600), "输入 + 输出 + 缓存写入");
+    assert_eq!(p2.meta.created_at, 1_736_500_000_000, "UUID v7 的前 48 位");
+    assert_eq!(p2.unknown_line_count, 1, "表外的块要计数");
+    let t2 = legacy.parse_transcript(&r2).unwrap();
+    assert_eq!(
+        roles_kinds(&t2.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::User, MessageKind::Text),
+            (Role::System, MessageKind::Meta),
+        ]
+    );
+    let first = &t2.mainline[1];
+    assert_eq!(
+        first.thinking.as_deref(),
+        Some("先确定测试框架"),
+        "独立的推理条目并进紧随的回答"
+    );
+    assert_eq!(first.tool_calls[0].name, "read_file");
+    assert!(first.tool_calls[0].is_error);
+    assert_eq!(
+        first.tool_calls[0].output.as_deref(),
+        Some("File not found: src/QrScanner.test.tsx")
+    );
+    assert_eq!(t2.mainline[2].tool_calls[0].name, "ask_followup_question");
+    assert_eq!(
+        t2.mainline[3].text, "vitest",
+        "追问的回答单独成一条用户消息"
+    );
+    let write = &t2.mainline[4];
+    assert_eq!(write.thinking.as_deref(), Some("写一个最小的卸载测试"));
+    assert!(write.tool_calls[0]
+        .output
+        .as_deref()
+        .unwrap()
+        .contains("wrote 1 file"));
+    assert!(
+        !t2.mainline
+            .iter()
+            .any(|m| m.role == Role::User && m.text.contains("not a user reply")),
+        "别的工具结果里出现 <answer> 不算用户的话"
+    );
+    assert_eq!(
+        t2.mainline[5].text, "测试已添加,vitest 跑通。",
+        "attempt_completion 的 result 是正文"
+    );
+    assert!(t2.mainline[5].tool_calls.is_empty());
+    // 完成后带截图的反馈:发起它的调用已转成正文,图归用户消息
+    assert_eq!(t2.mainline[6].text, "截图里按钮错位了");
+    assert_eq!(t2.mainline[6].images.len(), 1);
+    assert!(t2.mainline[7].text.starts_with("[ERROR]"));
+
+    // T3:T2 派出去的子任务,带一条上下文压缩的摘要
+    let t3 = legacy
+        .parse_transcript(&kilo_task_ref(&env.kilo_tasks, KILO_T3))
+        .unwrap();
+    assert_eq!(
+        roles_kinds(&t3.mainline),
+        vec![
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+            (Role::System, MessageKind::CompactSummary),
+            (Role::User, MessageKind::Text),
+        ]
+    );
+    assert_eq!(t3.mainline[3].text, "再跑一遍");
+    assert!(legacy.manages_parent_links() && legacy.parent_links_in_child());
+    let links = legacy.parent_links().expect("任务目录读得出来");
+    assert!(
+        links.contains(&(legacy_task_key(KILO_T3), legacy_task_key(KILO_T2))),
+        "{links:?}"
+    );
+
+    // 装在 Cursor 里的旧版:via 写的是 Cursor
+    let r7 = kilo_task_ref(&env.kilo_cursor_tasks, "cursor-task-0007");
+    assert_eq!(
+        legacy.parse_session(&r7).unwrap().meta.source.as_deref(),
+        Some("Cursor")
+    );
+
+    // 不进文件监听(任务目录里有整份 checkpoints 影子仓库);file_ref 只认正文文件
+    assert!(legacy.watch_paths().is_empty());
+    assert!(legacy
+        .file_ref(
+            &env.kilo_tasks
+                .join(KILO_T2)
+                .join("api_conversation_history.json")
+        )
+        .is_some());
+    for other in ["history_item.json", "ui_messages.json"] {
+        assert!(legacy
+            .file_ref(&env.kilo_tasks.join(KILO_T2).join(other))
+            .is_none());
+    }
+    // 删除:整个任务目录进废纸篓
+    assert_eq!(
+        legacy.session_paths(&p1.meta),
+        vec![env.kilo_tasks.join(KILO_T1).to_string_lossy().to_string()]
+    );
+}
+
+/// 索引读不出来(state.vscdb 坏了、也没有 _index.json)不等于父子关系都解除了:只记在
+/// 索引里的关系那一刻是"不知道",快照整份交 None,库里的关系原样留着
+#[test]
+fn kilo_unreadable_index_leaves_parent_links_unknown() {
+    let env = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path().join("Code").join("User").join("globalStorage");
+    let tasks = storage.join("kilocode.kilo-code").join("tasks");
+    // 子任务的关系只在 globalState 的 taskHistory 里(没有 history_item.json)
+    common::copy_tree(&env.kilo_tasks.join(KILO_T3), &tasks.join(KILO_T3));
+    fs::remove_file(tasks.join(KILO_T3).join("history_item.json")).unwrap();
+    fs::write(storage.join("state.vscdb"), b"not a sqlite database").unwrap();
+    let legacy = KiloLegacyAdapter::new().with_custom_root(tasks.clone());
+    assert_eq!(legacy.parent_links(), None);
+    // 会话照常列出(元数据退到从正文推)
+    assert_eq!(legacy.list_session_files().unwrap().len(), 1);
+}
+
+/// 缺 history_item.json 的老任务,标题等元数据来自索引:索引里那一条变了,任务的
+/// mtime / size 跟着变,增量扫描才会重解析(否则一直停在旧标题上)
+#[test]
+fn kilo_index_changes_mark_tasks_dirty() {
+    let env = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let tasks = dir.path().join("tasks");
+    common::copy_tree(&env.kilo_tasks.join(KILO_T1), &tasks.join(KILO_T1));
+    let index = |title: &str| {
+        let entry = serde_json::json!({ "entries": [{ "id": KILO_T1, "ts": 1736400006000_i64, "task": title }] });
+        fs::write(tasks.join("_index.json"), entry.to_string()).unwrap();
+    };
+    let legacy = KiloLegacyAdapter::new().with_custom_root(tasks.clone());
+    let fingerprint = || {
+        let r = legacy.list_session_files().unwrap().pop().unwrap();
+        (r.mtime_ms, r.size)
+    };
+    index("old title");
+    let before = fingerprint();
+    index("a renamed title");
+    touch_forward(&tasks.join("_index.json"), 5);
+    assert_ne!(fingerprint(), before);
+    let p = legacy
+        .parse_session(&legacy.list_session_files().unwrap().pop().unwrap())
+        .unwrap();
+    assert_eq!(p.meta.title, "a renamed title");
+}
+
+/// 自定义 location 与远程挂载点按路径形状挑实例(`claims_custom_root`):扩展的任务目录
+/// 归旧版实例,其余归 kilo.db 那个
+#[test]
+fn kilo_custom_roots_route_by_shape() {
+    let env = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let ext = env.kilo_tasks.parent().unwrap().to_path_buf();
+    let data = env.kilo_db.parent().unwrap().to_path_buf();
+    // 自定义实例追加在 roster 末尾
+    let custom = |picked: &Path| {
+        wake_core::adapters::create_adapters_with(&[(AgentId::Kilo, picked.to_path_buf())], &[])
+            .pop()
+            .expect("自定义实例")
+    };
+    // 旧版:选中任务目录、扩展目录、globalStorage 都认
+    for picked in [
+        env.kilo_tasks.clone(),
+        ext.clone(),
+        ext.parent().unwrap().to_path_buf(),
+    ] {
+        assert_eq!(
+            custom(&picked).data_roots(),
+            vec![env.kilo_tasks.clone()],
+            "{picked:?}"
+        );
+    }
+    // 新版:库文件、库所在目录、XDG data 根;认不出形状的也交给它
+    let nowhere = dir.path().join("nowhere");
+    for (picked, db) in [
+        (env.kilo_db.clone(), env.kilo_db.clone()),
+        (data.clone(), env.kilo_db.clone()),
+        (data.parent().unwrap().to_path_buf(), env.kilo_db.clone()),
+        (nowhere.clone(), nowhere.join("kilo.db")),
+    ] {
+        assert_eq!(custom(&picked).data_roots(), vec![db], "{picked:?}");
+    }
+    // 远程挂载点:同步前目录还不存在,按扩展 id 定形,挂的是旧版实例
+    let cache = dir.path().join("remotes").join("devbox");
+    let remote = wake_core::adapters::remote::create_remote_adapters(
+        &wake_core::adapters::create_adapters(),
+        "devbox",
+        &cache,
+    )
+    .into_iter()
+    .find(|a| a.agent() == AgentId::Kilo)
+    .expect("Kilo 的远程实例");
+    let mount = cache.join(".vscode-server/data/User/globalStorage/kilocode.kilo-code");
+    assert_eq!(remote.data_roots(), vec![mount.join("tasks")]);
+
+    // 自定义的旧版实例照样读得出会话;编辑器按路径认,认不出就没有 via
+    let legacy = custom(&env.kilo_tasks);
+    assert_eq!(legacy.list_session_files().unwrap().len(), 4);
+    let p = legacy
+        .parse_session(&kilo_task_ref(&env.kilo_tasks, KILO_T1))
+        .unwrap();
+    assert_eq!(p.meta.source.as_deref(), Some("VS Code"));
+    assert_eq!(p.meta.title, "修复二维码扫描的内存泄漏", "索引照样找得到");
+    let backup = dir.path().join("backup").join("tasks");
+    common::copy_tree(&env.kilo_tasks.join(KILO_T2), &backup.join(KILO_T2));
+    let p = custom(&backup)
+        .parse_session(&kilo_task_ref(&backup, KILO_T2))
+        .unwrap();
+    assert_eq!(p.meta.source, None);
+}
+
+#[test]
+fn kilo_two_sources_remove_and_route_independently() {
+    let env = setup();
+    let roster = wake_core::adapters::create_adapters();
+    let kilos: Vec<&Box<dyn AgentAdapter>> = roster
+        .iter()
+        .filter(|a| a.agent() == AgentId::Kilo)
+        .collect();
+    assert_eq!(kilos.len(), 2, "Kilo 应有新版库与旧版任务目录两个数据源");
+    let (db, legacy) = (kilos[0], kilos[1]);
+    assert_eq!(
+        db.data_roots(),
+        vec![env.kilo_db.clone()],
+        "kilo.db 在前:认不出形状的自定义 location 交给它"
+    );
+    // 导入过 kilo.db 的旧任务两边同 key,kilo.db 那份胜出(端到端见 scanner_finale)
+    let migrated = migrated_session_id("migrated-task-0004");
+    let db_copy = format!("{}#{migrated}", env.kilo_db.display());
+    let legacy_copy = env
+        .kilo_tasks
+        .join("migrated-task-0004")
+        .join("api_conversation_history.json");
+    assert!(db.dedup_rank(&db_copy) < legacy.dedup_rank(&legacy_copy.to_string_lossy()));
+    for a in &kilos {
+        assert!(a.supports_individual_root_removal());
+    }
+    // 移除 kilo.db:旧版实例的根原样;移除 VS Code 那条:Cursor 那条留着
+    assert!(db
+        .excluding_data_roots(std::slice::from_ref(&env.kilo_db))
+        .unwrap()
+        .data_roots()
+        .is_empty());
+    assert_eq!(
+        legacy
+            .excluding_data_roots(std::slice::from_ref(&env.kilo_db))
+            .unwrap()
+            .data_roots(),
+        legacy.data_roots()
+    );
+    assert_eq!(
+        legacy
+            .excluding_data_roots(std::slice::from_ref(&env.kilo_tasks))
+            .unwrap()
+            .data_roots(),
+        vec![env.kilo_cursor_tasks.clone()]
+    );
+    // 路由:任务文件归旧版实例(删除时交出的是任务目录),虚拟路径归库实例
+    let owner =
+        wake_core::adapters::adapter_for(&roster, AgentId::Kilo, &legacy_copy.to_string_lossy())
+            .expect("任务文件必须有实例认领");
+    assert_eq!(owner.data_roots(), legacy.data_roots());
+    let owner = wake_core::adapters::adapter_for(&roster, AgentId::Kilo, &db_copy)
+        .expect("库的虚拟路径必须有实例认领");
+    assert_eq!(owner.data_roots(), vec![env.kilo_db.clone()]);
+}
+
 #[test]
 fn hermes_parse_contract() {
     let env = setup();
@@ -3251,29 +4332,32 @@ fn hermes_parse_contract() {
     assert_eq!(a2.tool_calls[0].output.as_deref(), Some("README.md"));
     assert_eq!(a2.text, "好的。");
 
-    // 自定义 location:选 Hermes home(连同 profiles/*)或库文件本身都认
-    let home = env.hermes_db.parent().unwrap().to_path_buf();
+    // 自定义 location:选 Hermes home(连同 profiles/*)或库文件本身都认。在私有目录里搭
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join(".hermes");
+    let main_db = home.join("state.db");
     let profile_db = home.join("profiles").join("coder").join("state.db");
-    fs::create_dir_all(profile_db.parent().unwrap()).unwrap();
-    common::build_hermes_db(&profile_db);
+    for db in [&main_db, &profile_db] {
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        common::build_hermes_db(db);
+    }
     let rooted = HermesAdapter::new().with_custom_root(home.clone());
     assert_eq!(
         rooted.data_roots(),
-        vec![env.hermes_db.clone(), profile_db.clone()]
+        vec![main_db.clone(), profile_db.clone()]
     );
-    let direct = HermesAdapter::new().with_custom_root(env.hermes_db.clone());
-    assert_eq!(direct.data_roots(), vec![env.hermes_db.clone()]);
+    let direct = HermesAdapter::new().with_custom_root(main_db.clone());
+    assert_eq!(direct.data_roots(), vec![main_db.clone()]);
     // resume 必须带所属档案:主库 = default,profiles/<name> = name(虚拟路径同样认)
     use wake_core::adapters::hermes::profile_of;
     assert_eq!(
-        profile_of(&format!("{}#hs-0001", env.hermes_db.display())),
+        profile_of(&format!("{}#hs-0001", main_db.display())),
         "default"
     );
     assert_eq!(
         profile_of(&format!("{}#hs-0001", profile_db.display())),
         "coder"
     );
-    fs::remove_dir_all(home.join("profiles")).unwrap();
 }
 
 /// 没被新版 Hermes 迁移过的库(schema v2:无 title、无 cache/reasoning 列、

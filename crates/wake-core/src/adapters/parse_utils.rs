@@ -39,6 +39,11 @@ impl Drop for ImageDecodeBudgetGuard {
     }
 }
 
+/// 预算还放不放得下 `bytes`(只看不扣):读文件之前先问,放不下的连读都不读
+fn image_decode_budget_allows(bytes: usize) -> bool {
+    IMAGE_DECODE_REMAINING.with(|remaining| remaining.get().is_none_or(|left| bytes <= left))
+}
+
 fn consume_image_decode_budget(bytes: usize) -> bool {
     IMAGE_DECODE_REMAINING.with(|remaining| match remaining.get() {
         Some(left) if bytes <= left => {
@@ -50,13 +55,75 @@ fn consume_image_decode_budget(bytes: usize) -> bool {
     })
 }
 
+/// JSONL 逐行解成 JSON:空行跳过,读不出(坏 UTF-8)或不是 JSON 的行交成 `Ok(None)`,调用方计
+/// 未知行。读错误交一次 `Err` 就结束,调用方 `?` 出去让这次解析失败:`BufRead::lines` 遇到读
+/// 错误会一直交回同一个错误(EIO、断开的网络盘、Windows 上被别的进程锁住的文件),`continue`
+/// 接着读就是死循环——扫描线程卡在 SCAN_GATE 里,刷新弹窗永远关不掉;当成读完了,半截转录就
+/// 带着整个文件的 mtime / size 入库,文件不再变就永远停在半截。解析失败则库里的旧行原样留着、
+/// 下一轮再试
+pub fn jsonl_values<R: std::io::BufRead>(
+    reader: R,
+) -> impl Iterator<Item = std::io::Result<Option<Value>>> {
+    jsonl_rows(reader)
+}
+
+/// `jsonl_values` 的窄版:每行只反序列化成 `T`(用不到的字段直接跳过,不建整棵 Value 树),
+/// 读错误规则相同;读不出、不是 JSON、对不上形状的行交 `Ok(None)`
+pub fn jsonl_rows<T: serde::de::DeserializeOwned, R: std::io::BufRead>(
+    reader: R,
+) -> impl Iterator<Item = std::io::Result<Option<T>>> {
+    jsonl_lines(reader).filter_map(|line| match line {
+        Ok(Some(line)) if line.trim().is_empty() => None,
+        Ok(line) => Some(Ok(line.and_then(|line| serde_json::from_str(&line).ok()))),
+        Err(e) => Some(Err(e)),
+    })
+}
+
+/// `BufRead::lines` 加上上面那条读错误规则:坏 UTF-8 的行字节已经读过,交成 `Ok(None)` 接着读
+fn jsonl_lines<R: std::io::BufRead>(reader: R) -> JsonlLines<R> {
+    JsonlLines {
+        lines: reader.lines(),
+        done: false,
+    }
+}
+
+struct JsonlLines<R> {
+    lines: std::io::Lines<R>,
+    done: bool,
+}
+
+impl<R: std::io::BufRead> Iterator for JsonlLines<R> {
+    type Item = std::io::Result<Option<String>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.lines.next()? {
+            Ok(line) => Some(Ok(Some(line))),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Some(Ok(None)),
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
 /// 文件 mtime → epoch ms(各家 adapter 与 watcher 共用)
 pub fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
+    meta.modified().ok().and_then(system_time_ms).unwrap_or(0)
+}
+
+/// 文件创建时间 → epoch ms;平台或文件系统不记的给 None
+pub fn created_ms(meta: &std::fs::Metadata) -> Option<i64> {
+    meta.created().ok().and_then(system_time_ms)
+}
+
+fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
+    t.duration_since(std::time::UNIX_EPOCH)
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// cwd → 项目显示名(路径末段;空/异常 = "Unknown project")
@@ -68,6 +135,33 @@ pub fn project_name_of(cwd: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown project".to_string())
+}
+
+/// 项目路径的规范形。Windows 形状的路径(`c:\…`、`C:/…`、`//server/…`)盘符改大写,
+/// 在 Windows 上斜杠换成反斜杠:VS Code 的 fsPath 写小写盘符,OpenCode 系把目录存成
+/// 正斜杠(它自己读出来时再换回),原样用就与别家记下的 `C:\…` 分成两个项目。
+/// 另:URI 解码残留的前导斜杠形态(`/d:/…`)先剥掉——它是 `file:///d:/…` 在 Windows 上
+/// 留下的产物,原样使用会让各路扫描以 ERROR_INVALID_NAME 全数失败。
+/// POSIX 路径(含远程镜像来的)原样
+pub fn canonical_project_path(path: &str) -> String {
+    // 前导斜杠 + 盘符 + 分隔符(4 字节全匹配,冒号后必须是分隔符,避免误伤 /d:port/x)
+    let path = match path.as_bytes() {
+        [b'/', d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic() => &path[1..],
+        _ => path,
+    };
+    let drive = matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+    if !drive && !path.starts_with("//") {
+        return path.to_string();
+    }
+    let mut out = if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    };
+    if drive {
+        out[..1].make_ascii_uppercase();
+    }
+    out
 }
 
 /// user 消息的 kind:注入内容归 Meta 折叠
@@ -367,18 +461,61 @@ impl ParsedContent {
 }
 
 /// 把新内容并入已存在的消息，并同步平移图片的正文偏移。
-pub fn append_content_to_message(
-    message: &mut TranscriptMessage,
-    content: ParsedContent,
-    separator: &str,
-) {
+fn append_content_to_message(message: &mut TranscriptMessage, content: ParsedContent) {
     let mut combined = ParsedContent {
         text: std::mem::take(&mut message.text),
         images: std::mem::take(&mut message.images),
     };
-    combined.append_with_separator(content, separator);
+    combined.append_with_separator(content, "\n\n");
     message.text = combined.text;
     message.images = combined.images;
+}
+
+/// 一次模型调用的产出并进最后一条助手消息(最后一条不是助手就先开一条空的),返回它的下标
+/// (登记工具调用用)。整个 agentic 回合并成一条,单行 `text_msg` 的 clip 靠不住:正文合并后
+/// 统一压 MAX_MSG_TEXT(截过之后只收图片),thinking 压 MAX_TOOL_IO、截过就不再拼接——反复
+/// 对已带截断标记的串再 clip,标记前会一次次多出换行。截过的串连标记一起必然长过上限,所以
+/// 守卫是 `<=`:恰好停在上限上的还要再收一次,不然后面的正文悄悄丢掉、连标记都没有。
+/// 最后一条还没有时间时用这一次的
+pub fn merge_into_last_assistant(
+    messages: &mut Vec<TranscriptMessage>,
+    ts: i64,
+    content: ParsedContent,
+    thinking: &str,
+) -> usize {
+    if !matches!(messages.last(), Some(m) if m.role == Role::Assistant) {
+        messages.push(text_msg(Role::Assistant, "", ts));
+    }
+    let ix = messages.len() - 1;
+    let last = &mut messages[ix];
+    if last.timestamp.is_none() && ts > 0 {
+        last.timestamp = Some(ts);
+    }
+    if !content.text.is_empty() || !content.images.is_empty() {
+        if last.text.len() <= MAX_MSG_TEXT {
+            append_content_to_message(last, content);
+            if last.text.len() > MAX_MSG_TEXT {
+                last.text = clip(&last.text, MAX_MSG_TEXT).0;
+                last.truncated = true;
+            }
+        } else {
+            append_images_to_message_end(last, content.images);
+        }
+    }
+    let thinking = thinking.trim();
+    if !thinking.is_empty() && last.thinking.as_deref().map_or(0, str::len) <= MAX_TOOL_IO {
+        match &mut last.thinking {
+            Some(t) => {
+                t.push_str("\n\n");
+                t.push_str(thinking);
+                if t.len() > MAX_TOOL_IO {
+                    *t = clip(t, MAX_TOOL_IO).0;
+                }
+            }
+            slot => *slot = Some(clip(thinking, MAX_TOOL_IO).0),
+        }
+    }
+    ix
 }
 
 /// 工具结果不属于消息正文流；其图片统一放到现有正文末尾。
@@ -631,6 +768,56 @@ pub fn decode_data_uri(uri: &str) -> Option<ImageAttachment> {
     decode_base64_image(data, Some(media_type))
 }
 
+/// 会话自己目录里的图片文件(Antigravity 的 `.user_uploaded/`)→ 图片附件。只给 adapter 自己
+/// 枚举出来的文件用,**不要拿转录内容里写的路径来调**——那条路一律不解引用本地路径(见
+/// `image_parser_never_dereferences_local_paths`)。解开符号链接后必须仍在 `session` 目录里:
+/// 远程镜像原样保留符号链接,指到外面的会读到本机的文件(中间哪一层目录是链接都一样)。
+/// 类型按字节嗅探;解码预算与 base64 那条路同一份(调用方的解析要开着
+/// `transcript_image_decode_budget`),按 stat 到的大小先问预算再读
+pub fn image_from_session_file(
+    session: &std::path::Path,
+    path: &std::path::Path,
+) -> Option<ImageAttachment> {
+    let real = std::fs::canonicalize(path).ok()?;
+    if !real.starts_with(std::fs::canonicalize(session).ok()?) {
+        return None;
+    }
+    let len = std::fs::metadata(&real).ok()?.len();
+    if len == 0 || len > MAX_IMAGE_BYTES || !image_decode_budget_allows(len as usize) {
+        return None;
+    }
+    attachment_from_bytes(std::fs::read(&real).ok()?, None)
+}
+
+/// URI / 目录名里的 percent-encoding(`%2F` → `/`)。逐字节解,不成对的 `%` 原样留着,
+/// 后面跟着多字节字符也不会切坏(按 `&str` 下标切会 panic)
+pub fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut ix = 0;
+    while ix < bytes.len() {
+        if bytes[ix] == b'%' && ix + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_digit(bytes[ix + 1]), hex_digit(bytes[ix + 2])) {
+                out.push((high << 4) | low);
+                ix += 3;
+                continue;
+            }
+        }
+        out.push(bytes[ix]);
+        ix += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    Some(match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => return None,
+    })
+}
+
 fn attachment_from_bytes(bytes: Vec<u8>, media_type: Option<&str>) -> Option<ImageAttachment> {
     if bytes.is_empty() || bytes.len() as u64 > MAX_IMAGE_BYTES {
         return None;
@@ -773,6 +960,15 @@ impl<T: Clone> MtimeCache<T> {
 }
 
 /// tool_use 块 → ToolCallView(preview + pretty-print input 三件套统一)
+/// 工具调用的参数:模型常把它写成 JSON 字符串,解得开就用解开的,解不开(命令行、自由文本)
+/// 原样留着
+pub fn decoded_arguments(args: &Value) -> std::borrow::Cow<'_, Value> {
+    match args.as_str().and_then(|s| serde_json::from_str(s).ok()) {
+        Some(parsed) => std::borrow::Cow::Owned(parsed),
+        None => std::borrow::Cow::Borrowed(args),
+    }
+}
+
 pub fn tool_call_view(
     id: String,
     name: &str,
@@ -866,6 +1062,19 @@ pub fn epoch_ms(n: f64) -> i64 {
 
 /// 清洗标题候选:剥 slash-command 壳与 system-reminder 等标签,压单行截断。空串=不可用
 pub fn clean_title_candidate(raw: &str) -> String {
+    clean_user_text(raw, false)
+}
+
+/// 用户那句话折成一行(新会话开场交接里的 "last asked"):与标题同一套清洗,只是 slash 命令
+/// 写回用户敲的样子 `/name args`——标题只留参数,交接里要看得出是哪条命令。空串 = 不是人说的
+/// 话(只剩 `/model` 一类命令的输出等)
+pub fn clean_prompt_line(raw: &str) -> String {
+    clean_user_text(raw, true)
+}
+
+/// 两者共用的清洗;`whole_command` 定 slash 命令写成 `/name args`,还是只留参数(没有参数退
+/// 命令名)
+fn clean_user_text(raw: &str, whole_command: bool) -> String {
     let mut s = strip_tag_block(raw, "system-reminder");
     s = strip_tag_block(&s, "local-command-caveat");
     s = strip_tag_block(&s, "local-command-stdout");
@@ -873,10 +1082,11 @@ pub fn clean_title_candidate(raw: &str) -> String {
     let args = extract_tag(&s, "command-args");
     let name = extract_tag(&s, "command-name");
     if args.is_some() || name.is_some() {
-        s = args
-            .filter(|a| !a.trim().is_empty())
-            .or(name)
-            .unwrap_or_default();
+        let args = args.filter(|a| !a.trim().is_empty());
+        s = match (whole_command, name, args) {
+            (true, Some(name), args) => format!("{name} {}", args.unwrap_or_default()),
+            (_, name, args) => args.or(name).unwrap_or_default(),
+        };
     }
     // 去掉残余短标签
     let mut out = String::with_capacity(s.len());
@@ -905,22 +1115,7 @@ pub fn clean_title_candidate(raw: &str) -> String {
             out.push(c);
         }
     }
-    let compact = out
-        .replace(IMAGE_PLACEHOLDER, " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.is_empty() {
-        return String::new();
-    }
-    let chars: Vec<char> = compact.chars().collect();
-    if chars.len() > MAX_TITLE {
-        let mut t: String = chars[..MAX_TITLE].iter().collect();
-        t.push('…');
-        t
-    } else {
-        compact
-    }
+    crate::text::one_line(&out.replace(IMAGE_PLACEHOLDER, " "), MAX_TITLE)
 }
 
 fn strip_tag_block(s: &str, tag: &str) -> String {
@@ -974,6 +1169,9 @@ pub fn is_injected_user_content(text: &str) -> bool {
         "## Referenced ChatGPT conversation",
         // Codex 把 AGENTS.md 作为 user 消息注入
         "# AGENTS.md instructions",
+        // Claude Code 的后台任务(子代理、后台命令)结束时以 user 行注入的通知,不是人打的字;
+        // 不认它的话它会当成提问进 Insights、给分支会话起出 "b69tgbuwc toolu_…" 这种标题
+        "<task-notification",
         // Codex 的 subagent / 分支线程:父会话的整段 transcript 被打包成
         // 一条 role=user 消息喂进来,里面含父会话的 assistant 输出。不认它
         // 的话,父会话里 AI 说的话会显示成这个会话里用户发的
@@ -1036,6 +1234,130 @@ pub fn make_preview(input: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code 后台任务结束的通知是注入内容,不是提问;正文里提到这个词的照算人话
+    #[test]
+    fn task_notifications_are_injected_content() {
+        assert!(is_injected_user_content(
+            "<task-notification>\n<task-id>b69tgbuwc</task-id>\n<status>completed</status>"
+        ));
+        assert!(!is_injected_user_content(
+            "为什么 <task-notification> 会被当成提问?"
+        ));
+    }
+
+    #[test]
+    fn jsonl_lines_stop_on_a_persistent_read_error() {
+        // 一直读不出来(EIO、断开的网络盘):交一次 Err 就结束,不打转
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("disk gone"))
+            }
+        }
+        let mut lines = jsonl_lines(std::io::BufReader::new(Broken));
+        assert!(matches!(lines.next(), Some(Err(_))));
+        assert!(lines.next().is_none());
+        // 坏 UTF-8 的行跳过,接着读
+        let data: &[u8] = b"{\"a\":1}\n\xff\xfe\n{\"b\":2}\n";
+        let lines: Vec<_> = jsonl_lines(data).map(Result::unwrap).collect();
+        assert_eq!(
+            lines,
+            vec![
+                Some("{\"a\":1}".to_string()),
+                None,
+                Some("{\"b\":2}".to_string())
+            ]
+        );
+        // 解成 JSON:空行跳过,坏行与不是 JSON 的行都交 None
+        let data: &[u8] = b"{\"a\":1}\n\n  \nnot json\n\xff\n{\"b\":2}";
+        let values: Vec<_> = jsonl_values(data).map(Result::unwrap).collect();
+        assert_eq!(
+            values,
+            vec![
+                Some(serde_json::json!({"a": 1})),
+                None,
+                None,
+                Some(serde_json::json!({"b": 2}))
+            ]
+        );
+    }
+
+    #[test]
+    fn merging_into_the_last_assistant_caps_text_and_thinking() {
+        let content = |text: &str| ParsedContent {
+            text: text.to_string(),
+            images: Vec::new(),
+        };
+        let mut messages = vec![text_msg(Role::User, "hi", 1)];
+        // 最后一条是用户:先开一条空的助手消息
+        assert_eq!(
+            merge_into_last_assistant(&mut messages, 0, content(""), "plan"),
+            1
+        );
+        assert_eq!(messages[1].timestamp, None);
+        let big = "x".repeat(MAX_MSG_TEXT);
+        let long_thinking = "t".repeat(MAX_TOOL_IO);
+        for ts in [2, 3] {
+            merge_into_last_assistant(&mut messages, ts, content(&big), &long_thinking);
+        }
+        assert_eq!(messages.len(), 2);
+        let reply = &messages[1];
+        assert_eq!(reply.timestamp, Some(2), "还没有时间的用第一次带时间的");
+        assert!(reply.truncated);
+        assert_eq!(reply.text.matches("(truncated)").count(), 1);
+        let thinking = reply.thinking.clone().unwrap();
+        assert!(thinking.starts_with("plan\n\n"));
+        assert_eq!(thinking.matches("(truncated)").count(), 1);
+        // 到上限后不再拼接,也不再反复 clip
+        merge_into_last_assistant(&mut messages, 4, content(""), "more");
+        assert_eq!(messages[1].thinking.as_deref(), Some(thinking.as_str()));
+    }
+
+    #[test]
+    fn percent_decode_walks_bytes() {
+        assert_eq!(percent_decode("/Users/a%20b/%E4%B8%AD"), "/Users/a b/中");
+        // 不成对的 `%`、后面跟多字节字符的 `%` 原样留着,不 panic
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%中%z9"), "%中%z9");
+    }
+
+    /// Windows 形状的项目路径换成别家记的写法:盘符大写、Windows 上正斜杠换反斜杠;
+    /// POSIX 路径(含远程镜像来的)原样
+    #[test]
+    fn project_paths_are_canonical() {
+        assert_eq!(canonical_project_path("/Users/x/app"), "/Users/x/app");
+        assert_eq!(canonical_project_path(r"c:\Users\x\app"), r"C:\Users\x\app");
+        if cfg!(windows) {
+            assert_eq!(canonical_project_path("c:/Users/x/app"), r"C:\Users\x\app");
+            assert_eq!(
+                canonical_project_path("//nas/share/app"),
+                r"\\nas\share\app"
+            );
+        } else {
+            assert_eq!(canonical_project_path("c:/Users/x/app"), "C:/Users/x/app");
+            assert_eq!(canonical_project_path("//nas/share/app"), "//nas/share/app");
+        }
+    }
+
+    /// `file:///d:/…` 解码残留的前导斜杠:必须剥掉,否则 Windows 上全部扫描失败
+    #[test]
+    fn leading_slash_drive_paths_are_unwrapped() {
+        if cfg!(windows) {
+            assert_eq!(
+                canonical_project_path("/d:/考研/obsidian"),
+                r"D:\考研\obsidian"
+            );
+        } else {
+            assert_eq!(
+                canonical_project_path("/d:/考研/obsidian"),
+                "D:/考研/obsidian"
+            );
+        }
+        // 负例:冒号后不是分隔符的 POSIX 路径不能被误剥(冒号在 POSIX 中是合法文件名字符)
+        assert_eq!(canonical_project_path("/d:port/x"), "/d:port/x");
+        assert_eq!(canonical_project_path("/d:foo"), "/d:foo");
+    }
 
     #[test]
     fn clip_chars_counts_characters() {
