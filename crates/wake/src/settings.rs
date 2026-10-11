@@ -31,12 +31,12 @@ const SETTINGS_SIDEBAR_W: Zpx = Zpx(180.);
 const SETTINGS_TITLEBAR_H: Zpx = Zpx(34.);
 const SETTINGS_PAGE_TOP: Zpx = Zpx(38.);
 /// Connect 页两条 Setup guide 的去处:MCP 面与命令行面各自的完整文档
-const CONNECT_GUIDE_URL: &str = "https://github.com/iAmCorey/Wake/blob/main/docs/mcp.md";
-const CONNECT_CLI_GUIDE_URL: &str = "https://github.com/iAmCorey/Wake/blob/main/docs/cli.md";
+const CONNECT_GUIDE_URL: &str = "https://github.com/still12281/Wake/blob/main/docs/mcp.md";
+const CONNECT_CLI_GUIDE_URL: &str = "https://github.com/still12281/Wake/blob/main/docs/cli.md";
 const CONNECT_CLAUDE_PLUGIN_GUIDE_URL: &str =
-    "https://github.com/iAmCorey/Wake/blob/main/docs/cli.md#claude-code-plugin";
+    "https://github.com/still12281/Wake/blob/main/docs/cli.md#claude-code-plugin";
 const CONNECT_CODEX_PLUGIN_GUIDE_URL: &str =
-    "https://github.com/iAmCorey/Wake/blob/main/docs/cli.md#codex-plugin";
+    "https://github.com/still12281/Wake/blob/main/docs/cli.md#codex-plugin";
 
 fn icon(path: &'static str) -> Icon {
     Icon::empty().path(path)
@@ -1261,7 +1261,7 @@ impl SettingsView {
                     .child(div().mt(zpx(14.)).child(self.about_link(
                         "about-github",
                         "GitHub ↗",
-                        "https://github.com/iAmCorey/Wake",
+                        "https://github.com/still12281/Wake",
                         cx,
                     )))
                     .child(div().w(zpx(32.)).h(px(1.)).my(SPACE_LG).bg(theme.border))

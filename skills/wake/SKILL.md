@@ -26,7 +26,7 @@ Use whichever resolves. On Linux it is on `PATH` after a deb install, or at
 
 Two things can be missing, and they need different answers:
 
-- **No binary.** Say so — the user needs [Wake](https://github.com/iAmCorey/Wake).
+- **No binary.** Say so — the user needs [Wake](https://github.com/still12281/Wake).
   Do not try to install it yourself.
 - **No index** (`no Wake index at … — launch Wake once to build it`). Wake is
   installed but has never run. Run `wake-cli index` once; it builds the index in a

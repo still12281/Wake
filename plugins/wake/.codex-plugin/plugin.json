@@ -4,10 +4,10 @@
   "description": "Every new session starts knowing where your coding agents left off in this project, and Wake's MCP tools let Codex search and read any earlier session from any agent. Read-only; needs the Wake app.",
   "author": {
     "name": "Corey Chiu",
-    "url": "https://github.com/iAmCorey"
+    "url": "https://github.com/still12281"
   },
-  "homepage": "https://github.com/iAmCorey/Wake",
-  "repository": "https://github.com/iAmCorey/Wake",
+  "homepage": "https://github.com/still12281/Wake",
+  "repository": "https://github.com/still12281/Wake",
   "license": "MIT",
   "keywords": [
     "sessions",
@@ -38,7 +38,7 @@
     "capabilities": [
       "Read"
     ],
-    "websiteURL": "https://github.com/iAmCorey/Wake",
+    "websiteURL": "https://github.com/still12281/Wake",
     "defaultPrompt": [
       "What was I working on in this project?",
       "Did we discuss this error in an earlier session?",

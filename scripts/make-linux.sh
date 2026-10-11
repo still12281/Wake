@@ -78,7 +78,7 @@ Priority: optional
 Architecture: ${ARCH}
 Depends: libc6, libgcc-s1, libfreetype6, libfontconfig1, zlib1g, libxcb1, libxcb-xkb1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libvulkan1, mesa-vulkan-drivers, xdg-utils
 Maintainer: Corey Chiu <iamcoreychiu@gmail.com>
-Homepage: https://github.com/iAmCorey/Wake
+Homepage: https://github.com/still12281/Wake
 Description: Coding agent session manager
  Browse, search and resume sessions from Claude Code, Codex and
  other local coding agents in one place.
