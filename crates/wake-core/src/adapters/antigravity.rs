@@ -526,13 +526,14 @@ fn tool_args(args: Option<&Value>) -> Cow<'_, Value> {
 fn first_str(args: &Value, keys: &[&str]) -> Option<String> {
     let map = args.as_object()?;
     keys.iter().find_map(|key| {
-        let value = map
-            .get(*key)?
-            .as_str()?
-            .trim()
-            .trim_matches(['"', '\''])
-            .trim();
-        (!value.is_empty()).then(|| value.to_string())
+        let raw = map.get(*key)?.as_str()?.trim();
+        // Antigravity 把参数值存成"JSON 字符串的字符串"(双层编码):先按 JSON 字符串
+        // 解一层(引号与转义一并还原),解不开退回只剥引号的旧路径——只剥引号会让
+        // Windows 路径留下转义反斜杠,项目路径被写成双反斜杠、条目分裂(本机实测)。
+        let value = serde_json::from_str::<String>(raw)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| raw.trim_matches(['"', '\'']).trim().to_string());
+        (!value.is_empty()).then_some(value)
     })
 }
 
@@ -739,6 +740,25 @@ impl AgentAdapter for AntigravityAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Antigravity 的 tool args 值常是"JSON 字符串的字符串"(双层编码):first_str 要先
+    /// 按 JSON 字符串解一层(引号与转义一并还原)。只剥引号会留下转义反斜杠——本机
+    /// 实测曾把项目路径写成双反斜杠,项目条目分裂。
+    #[test]
+    fn first_str_unwraps_double_encoded_values() {
+        // 真实形态:值 = 带引号的 JSON 字符串文本("E:\\日常" 的双层编码)
+        let args: Value = serde_json::from_str("{\"Cwd\":\"\\\"E:\\\\\\\\日常\\\"\"}").unwrap();
+        assert_eq!(first_str(&args, CWD_KEYS).as_deref(), Some("E:\\日常"));
+        // 无引号的普通值原样保留(JSON 解析失败,走回退)
+        let args: Value = serde_json::from_str("{\"Cwd\":\"E:\\\\日常\"}").unwrap();
+        assert_eq!(first_str(&args, CWD_KEYS).as_deref(), Some("E:\\日常"));
+        // 带引号但非 JSON 转义(单反斜杠):回退到剥引号
+        let args = serde_json::json!({ "Cwd": "\"E:\\日常\"" });
+        assert_eq!(first_str(&args, CWD_KEYS).as_deref(), Some("E:\\日常"));
+        // POSIX 双双编码
+        let args = serde_json::json!({ "Cwd": "\"/Users/x/app\"" });
+        assert_eq!(first_str(&args, CWD_KEYS).as_deref(), Some("/Users/x/app"));
+    }
 
     #[test]
     fn user_input_metadata_is_read_out_of_the_injected_blocks() {
