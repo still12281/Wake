@@ -29,7 +29,7 @@ fn resolve_in(arg: &str, projects: &[ProjectInfo], home: Option<&str>) -> Vec<St
     if looks_like_path(wanted) {
         if let Some(p) = projects
             .iter()
-            .find(|p| strip_trailing_sep(&p.path) == wanted)
+            .find(|p| strip_trailing_sep(&fold(&p.path)) == strip_trailing_sep(&fold(wanted)))
         {
             return vec![p.path.clone()];
         }
@@ -41,7 +41,7 @@ fn resolve_in(arg: &str, projects: &[ProjectInfo], home: Option<&str>) -> Vec<St
             .iter()
             .filter(|p| !p.path.is_empty() && !catch_all(&p.path, home))
         {
-            if path_owns(&p.path, wanted) && best.is_none_or(|b| p.path.len() > b.path.len()) {
+            if owns_folded(&p.path, wanted) && best.is_none_or(|b| p.path.len() > b.path.len()) {
                 best = Some(p);
             }
         }
@@ -50,7 +50,7 @@ fn resolve_in(arg: &str, projects: &[ProjectInfo], home: Option<&str>) -> Vec<St
         }
         let mut inside: Vec<String> = projects
             .iter()
-            .filter(|p| !p.path.is_empty() && path_owns(wanted, &p.path))
+            .filter(|p| !p.path.is_empty() && owns_folded(wanted, &p.path))
             .map(|p| p.path.clone())
             .collect();
         inside.sort();
@@ -66,6 +66,23 @@ fn resolve_in(arg: &str, projects: &[ProjectInfo], home: Option<&str>) -> Vec<St
     matched.sort();
     matched.dedup();
     matched
+}
+
+/// 解析入参用:Windows 上折叠大小写与分隔符(NTFS 语义:大小写不敏感、`/` 与 `\`
+/// 等价),让 `e:/AI/x` 也能命中索引里的 `E:\ai\x`;其他平台原样——Linux 的文件
+/// 系统大小写敏感,折叠会制造假阳性
+fn fold(s: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        std::borrow::Cow::Owned(s.replace('/', "\\").to_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// `path_owns` 的折叠版:仅用于解析入参的项目过滤;全局归属判定(scanner 归属、
+/// cleanup 含界校验)仍走 `path_owns` 原语义,不受此影响
+fn owns_folded(root: &str, path: &str) -> bool {
+    path_owns(&fold(root), &fold(path))
 }
 
 /// 一切路径的祖先、当不了"所在项目"的目录:文件系统根(`/`、`C:\`)与家目录
@@ -255,6 +272,38 @@ mod tests {
             resolve_project_paths(r"C:\Users\t\Github\wake\src", &p),
             vec![r"C:\Users\t\Github\wake".to_string()]
         );
+    }
+
+    /// Windows:NTFS 语义下大小写与分隔符不敏感,索引里的 `E:\ai\evolution`
+    /// 要能被 `e:\ai\evolution`、`E:/ai/evolution` 等变体命中(N-1)
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_variants_fold_to_the_same_project() {
+        let p = vec![
+            project(r"E:\ai\evolution", "evolution"),
+            project(r"E:\ai\evolution-old", "evolution-old"),
+            project(r"D:\考研\obsidian", "obsidian"),
+        ];
+        for arg in [
+            r"E:\ai\evolution",
+            r"e:\ai\evolution",
+            "E:/ai/evolution",
+            "e:/ai/evolution",
+            "e:/AI/Evolution",
+        ] {
+            assert_eq!(
+                resolve_project_paths(arg, &p),
+                vec![r"E:\ai\evolution".to_string()],
+                "{arg}"
+            );
+        }
+        // 项目内子目录(含大小写/分隔符变体)仍收敛到该项目
+        assert_eq!(
+            resolve_project_paths("E:/AI/evolution/agent_memory", &p),
+            vec![r"E:\ai\evolution".to_string()]
+        );
+        // 前缀相近的兄弟目录不混淆
+        assert!(resolve_project_paths(r"e:\ai\evolutio", &p).is_empty());
     }
 
     #[test]
