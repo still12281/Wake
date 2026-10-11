@@ -69,14 +69,16 @@ impl AntigravityAdapter {
     /// 索引库目录名随安装形态而变(桌面端/CLI/IDE;Windows 与 macOS 也不一致):
     /// 逐候选探测实际存在的那个——曾硬编码 `antigravity-cli`,Windows 上该目录
     /// 不存在,整库索引不可用(标题降级为转录首句、子会话标记失效;本机实测 64
-    /// 会话受影响)。都没有时给出主名,交给 index() 的 is_file 守卫不猜存在性。
+    /// 会话受影响)。都没有时**回落到上游的确定性默认 `antigravity-cli`**——
+    /// 远程缓存场景(`REMOTE_LAYOUTS` 的 `.gemini` mount)构造时目录可能还没同步,
+    /// data_roots 必须在"未同步/已同步"两态下一致,兜底不能随存在性漂移。
     fn at(gemini: &Path) -> Self {
         const DB_DIRS: [&str; 3] = ["antigravity-cli", "antigravity", "antigravity-ide"];
         let db = DB_DIRS
             .iter()
             .map(|dir| gemini.join(dir).join(DB_FILE))
             .find(|path| path.is_file())
-            .unwrap_or_else(|| gemini.join("antigravity").join(DB_FILE));
+            .unwrap_or_else(|| gemini.join("antigravity-cli").join(DB_FILE));
         Self::from_parts(
             Some(db),
             APP_DIRS
@@ -773,11 +775,12 @@ mod tests {
             AntigravityAdapter::at(gemini).db.as_deref(),
             Some(cli.as_path())
         );
-        // 都没有:给出主名,不猜存在性
+        // 都没有:回落到上游的确定性默认(antigravity-cli)——远程未同步时的
+        // data_roots 契约要求兜底不随存在性漂移(见 remote_mount_shaping 测试)
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
             AntigravityAdapter::at(empty.path()).db.as_deref(),
-            Some(empty.path().join("antigravity").join(DB_FILE).as_path())
+            Some(empty.path().join("antigravity-cli").join(DB_FILE).as_path())
         );
     }
 
