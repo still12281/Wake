@@ -140,8 +140,15 @@ pub fn project_name_of(cwd: &str) -> String {
 /// 项目路径的规范形。Windows 形状的路径(`c:\…`、`C:/…`、`//server/…`)盘符改大写,
 /// 在 Windows 上斜杠换成反斜杠:VS Code 的 fsPath 写小写盘符,OpenCode 系把目录存成
 /// 正斜杠(它自己读出来时再换回),原样用就与别家记下的 `C:\…` 分成两个项目。
+/// 另:URI 解码残留的前导斜杠形态(`/d:/…`)先剥掉——它是 `file:///d:/…` 在 Windows 上
+/// 留下的产物,原样使用会让各路扫描以 ERROR_INVALID_NAME 全数失败。
 /// POSIX 路径(含远程镜像来的)原样
 pub fn canonical_project_path(path: &str) -> String {
+    // 前导斜杠 + 盘符 + 分隔符(4 字节全匹配,冒号后必须是分隔符,避免误伤 /d:port/x)
+    let path = match path.as_bytes() {
+        [b'/', d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic() => &path[1..],
+        _ => path,
+    };
     let drive = matches!(path.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
     if !drive && !path.starts_with("//") {
         return path.to_string();
@@ -1331,6 +1338,25 @@ mod tests {
             assert_eq!(canonical_project_path("c:/Users/x/app"), "C:/Users/x/app");
             assert_eq!(canonical_project_path("//nas/share/app"), "//nas/share/app");
         }
+    }
+
+    /// `file:///d:/…` 解码残留的前导斜杠:必须剥掉,否则 Windows 上全部扫描失败
+    #[test]
+    fn leading_slash_drive_paths_are_unwrapped() {
+        if cfg!(windows) {
+            assert_eq!(
+                canonical_project_path("/d:/考研/obsidian"),
+                r"D:\考研\obsidian"
+            );
+        } else {
+            assert_eq!(
+                canonical_project_path("/d:/考研/obsidian"),
+                "D:/考研/obsidian"
+            );
+        }
+        // 负例:冒号后不是分隔符的 POSIX 路径不能被误剥(冒号在 POSIX 中是合法文件名字符)
+        assert_eq!(canonical_project_path("/d:port/x"), "/d:port/x");
+        assert_eq!(canonical_project_path("/d:foo"), "/d:foo");
     }
 
     #[test]
