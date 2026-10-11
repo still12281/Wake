@@ -301,7 +301,6 @@ mod tests {
             forward.clone(),
             format!("{display}:11"),
             format!("{forward}:11"),
-            with_space.display().to_string().replace(' ', "%20"),
             Url::from_file_path(&file).unwrap().to_string(),
             format!("file:{}", Url::from_file_path(&file).unwrap().path()),
             format!(
@@ -315,6 +314,14 @@ mod tests {
             };
             assert_eq!(path, file, "{href}");
         }
+
+        // 含空格文件名的 %20 编码形态:只解码一次,落到真实空格名
+        let encoded = with_space.display().to_string().replace(' ', "%20");
+        let target = resolve_link(&encoded, false, "", || None);
+        let LinkTarget::File(path) = target else {
+            panic!("{encoded:?}: {target:?}");
+        };
+        assert_eq!(path, with_space, "{encoded}");
 
         // 目录(资源管理器定位)同样可打开
         assert_eq!(
