@@ -378,7 +378,7 @@ fn build_meta(agent: AgentId, r: &SessionFileRef, parsed: &ParseResult) -> Sessi
         id: r.native_id.clone(),
         agent,
         title,
-        project_path: parsed.cwd.clone(),
+        project_path: canonical_project_path(&parsed.cwd),
         project_name: project_name_of(&parsed.cwd),
         file_path: r.file_path.clone(),
         created_at: if parsed.created_at > 0 {
