@@ -879,6 +879,16 @@ pub fn project_instruction_sources(agent: AgentId) -> Vec<MemorySource> {
         AgentId::Cursor => vec![dir(".cursor/rules", "mdc"), file(".cursorrules")],
         AgentId::Kiro => vec![dir(".kiro/steering", "md")],
         AgentId::Copilot => vec![file(".github/copilot-instructions.md")],
+        AgentId::Antigravity => vec![
+            file("GEMINI.md"),
+            file("AGENTS.md"),
+            dir(".agent/rules", "md"),
+            // 持久记忆三件套(长期背景/阶段游标/活跃风险);handoff_*.md 等
+            // 会话交接产物是过程性中间件,不随此注册进入 Memory。
+            file("agent_memory/context.md"),
+            file("agent_memory/progress.md"),
+            file("agent_memory/bugs.md"),
+        ],
         _ => Vec::new(),
     }
 }
