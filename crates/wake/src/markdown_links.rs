@@ -1,4 +1,5 @@
-//! macOS 会话正文的文件链接。路径归属来自会话,不能从本机同名文件推断。
+//! 会话正文的文件链接。路径归属来自会话,不能从本机同名文件推断。
+//! macOS/Linux 处理 POSIX 路径;Windows 额外支持盘符路径(`X:\…`/`X:/…`)。
 use std::path::{Path, PathBuf};
 
 use gpui::{ClickEvent, MouseButton};
@@ -9,10 +10,6 @@ use url::Url;
 use crate::i18n::t;
 
 pub(crate) fn with_session_links(view: TextView, host: &str, project_path: &str) -> TextView {
-    // 本轮只接管 macOS;其余平台保留组件默认行为,仍参与编译检查。
-    if !cfg!(target_os = "macos") {
-        return view;
-    }
     let remote = !host.is_empty();
     let project_path = project_path.to_owned();
     view.on_link_click(move |href, event, window, cx| {
@@ -34,7 +31,7 @@ pub(crate) fn with_session_links(view: TextView, host: &str, project_path: &str)
                     wake_core::services::terminal::open_in_file_manager(path);
                 } else {
                     window.push_notification(
-                        Notification::info(t("The linked path is unavailable on this Mac.")),
+                        Notification::info(t("The linked path is unavailable.")),
                         cx,
                     );
                 }
@@ -45,10 +42,8 @@ pub(crate) fn with_session_links(view: TextView, host: &str, project_path: &str)
                 )),
                 cx,
             ),
-            LinkTarget::Unavailable => window.push_notification(
-                Notification::info(t("The linked path is unavailable on this Mac.")),
-                cx,
-            ),
+            LinkTarget::Unavailable => window
+                .push_notification(Notification::info(t("The linked path is unavailable.")), cx),
             LinkTarget::Ignore => {}
         }
     })
@@ -90,8 +85,21 @@ fn resolve_link(
     if remote {
         return LinkTarget::Remote;
     }
-    if windows || href.chars().any(char::is_control) {
+    if href.chars().any(char::is_control) {
         return LinkTarget::Unavailable;
+    }
+    // 盘符路径:Windows 上交给资源管理器定位;其余平台无法展开,保持不可用。
+    if windows {
+        if !cfg!(windows) {
+            return LinkTarget::Unavailable;
+        }
+        if let Some(path) = existing_windows_path(href) {
+            return LinkTarget::File(path);
+        }
+        return without_line_number(href)
+            .and_then(existing_windows_path)
+            .filter(|path| path.is_file())
+            .map_or(LinkTarget::Unavailable, LinkTarget::File);
     }
     if scheme.is_some() {
         let Some(path) = file_uri_path(href) else {
@@ -160,6 +168,30 @@ fn windows_path(path: &str) -> bool {
                 || (bytes[2] == b'/' && bytes.get(3) != Some(&b'/'))))
 }
 
+/// Windows 盘符路径的查找(原字面优先,失败再按 Markdown 编码解码一次)。
+/// 只认 `X:\…` 与 `X:/…` 绝对形式;裸 `X:`、URL 式 `X://…`、UNC 与相对路径不在此列。
+fn existing_windows_path(href: &str) -> Option<PathBuf> {
+    if let Some(path) = windows_drive_path(href).filter(|path| path.exists()) {
+        return Some(path);
+    }
+    // 与 local_path 的既有约定一致:只解码一次,不猜测缺失的段。
+    if href.contains('%') {
+        if let Ok(decoded) = percent_decode_str(href).decode_utf8() {
+            return windows_drive_path(&decoded).filter(|path| path.exists());
+        }
+    }
+    None
+}
+
+fn windows_drive_path(href: &str) -> Option<PathBuf> {
+    let bytes = href.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || (bytes[2] == b'/' && bytes.get(3) != Some(&b'/'))))
+    .then(|| PathBuf::from(href))
+}
+
 fn file_uri_path(href: &str) -> Option<PathBuf> {
     // file:relative 和反斜杠纠正不在本轮范围,不让宽松 URL 解析猜成本机路径。
     if !href.split_once(':')?.1.starts_with('/') || href.contains('\\') {
@@ -174,7 +206,11 @@ fn file_uri_path(href: &str) -> Option<PathBuf> {
     }
     let path = url.to_file_path().ok()?;
     let text = path.to_str()?;
-    if !path.is_absolute() || text.starts_with("//") || windows_path(text.trim_start_matches('/')) {
+    if !path.is_absolute() || text.starts_with("//") {
+        return None;
+    }
+    // Windows 上 `file:///C:/…` 解出的盘符路径就是目标形态;其余平台无法展开,保持拒绝。
+    if !cfg!(windows) && windows_path(text.trim_start_matches('/')) {
         return None;
     }
     Some(path)
@@ -207,7 +243,7 @@ fn local_path(href: &str, project_path: &str, home: Option<&Path>) -> Option<Pat
     path.is_absolute().then_some(path)
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::AppContext as _;
@@ -244,6 +280,63 @@ mod tests {
             resolve_link(project_text, false, "", || None),
             LinkTarget::File(project)
         );
+    }
+
+    /// Windows 盘符路径:正/反斜杠、带行号、file URI 均可定位;
+    /// 裸盘符、UNC、不存在路径保持不可用(UNC 明确不支持)。
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_paths_resolve_from_chat() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("src/main.rs");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "").unwrap();
+        let display = file.display().to_string();
+        let forward = display.replace('\\', "/");
+        let with_space = temp.path().join("source file.rs");
+        fs::write(&with_space, "").unwrap();
+
+        for href in [
+            display.clone(),
+            forward.clone(),
+            format!("{display}:11"),
+            format!("{forward}:11"),
+            with_space.display().to_string().replace(' ', "%20"),
+            Url::from_file_path(&file).unwrap().to_string(),
+            format!("file:{}", Url::from_file_path(&file).unwrap().path()),
+            format!(
+                "FILE://localhost{}",
+                Url::from_file_path(&file).unwrap().path()
+            ),
+        ] {
+            let target = resolve_link(&href, false, "", || None);
+            let LinkTarget::File(path) = target else {
+                panic!("{href:?}: {target:?}");
+            };
+            assert_eq!(path, file, "{href}");
+        }
+
+        // 目录(资源管理器定位)同样可打开
+        assert_eq!(
+            resolve_link(temp.path().to_str().unwrap(), false, "", || None),
+            LinkTarget::File(temp.path().to_path_buf())
+        );
+
+        // 不存在 / UNC / 裸盘符:保持不可用
+        for href in [
+            r"C:\wake-link-test-missing\a.rs",
+            "C:/wake-link-test-missing/a.rs",
+            r"C:\wake-link-test-missing\a.rs:11",
+            r"\\server\share\a.rs",
+            r"\\server\share\a.rs:11",
+            "C:",
+        ] {
+            assert_eq!(
+                resolve_link(href, false, "", || None),
+                LinkTarget::Unavailable,
+                "{href}"
+            );
+        }
     }
 
     #[test]
@@ -284,12 +377,16 @@ mod tests {
             LinkTarget::File(file)
         );
         // A literal filename containing the suffix still takes precedence.
-        let literal = temp.path().join("main.rs:11");
-        fs::write(&literal, "").unwrap();
-        assert_eq!(
-            resolve_link("main.rs:11", false, project, || None),
-            LinkTarget::File(literal)
-        );
+        // 含 ':' 的文件名在 Windows 上不可创建,该形态仅在 POSIX 上验证。
+        #[cfg(not(windows))]
+        {
+            let literal = temp.path().join("main.rs:11");
+            fs::write(&literal, "").unwrap();
+            assert_eq!(
+                resolve_link("main.rs:11", false, project, || None),
+                LinkTarget::File(literal)
+            );
+        }
         for (href, project) in [("missing.rs:11", project), ("main.rs:11", "")] {
             assert_eq!(
                 resolve_link(href, false, project, || None),
@@ -302,20 +399,25 @@ mod tests {
     fn line_numbers_preserve_literal_names_and_require_a_file() {
         let temp = tempfile::tempdir().unwrap();
         let file = temp.path().join("source file.rs");
-        let literal = temp.path().join("source file.rs:11");
+        fs::write(&file, "").unwrap();
         // 即使去掉行号后两种拼法都存在,完整的解码文件名也优先。
-        for path in [&file, &literal, &temp.path().join("source%20file.rs")] {
-            fs::write(path, "").unwrap();
-        }
-        for href in [
-            literal.to_str().unwrap().to_owned(),
-            literal.to_str().unwrap().replace(' ', "%20"),
-            Url::from_file_path(&literal).unwrap().to_string(),
-        ] {
-            assert_eq!(
-                resolve_link(&href, false, "", || None),
-                LinkTarget::File(literal.clone())
-            );
+        // 含 ':' 的文件名在 Windows 上不可创建,该段仅在 POSIX 上验证。
+        #[cfg(not(windows))]
+        {
+            let literal = temp.path().join("source file.rs:11");
+            for path in [&file, &literal, &temp.path().join("source%20file.rs")] {
+                fs::write(path, "").unwrap();
+            }
+            for href in [
+                literal.to_str().unwrap().to_owned(),
+                literal.to_str().unwrap().replace(' ', "%20"),
+                Url::from_file_path(&literal).unwrap().to_string(),
+            ] {
+                assert_eq!(
+                    resolve_link(&href, false, "", || None),
+                    LinkTarget::File(literal.clone())
+                );
+            }
         }
         for suffix in [":0", ":+11", ":-11", ":line11", "%3A12", ":11#fragment"] {
             for base in [
@@ -339,13 +441,23 @@ mod tests {
     #[test]
     fn filenames_are_not_reinterpreted_or_decoded_twice() {
         let temp = tempfile::tempdir().unwrap();
-        for name in [
+        // ':' 是 Windows 文件名的保留字符,含冒号字面名仅在 POSIX 上可复现。
+        #[cfg(windows)]
+        let names = [
+            "中文 #1%.md",
+            "literal%20space.md",
+            "literal space.md",
+            "name#L42",
+        ];
+        #[cfg(not(windows))]
+        let names = [
             "中文 #1%.md",
             "literal%20space.md",
             "literal space.md",
             "name:42",
             "name#L42",
-        ] {
+        ];
+        for name in names {
             let path = temp.path().join(name);
             fs::write(&path, "").unwrap();
             for href in [

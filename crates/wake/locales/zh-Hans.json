@@ -293,7 +293,7 @@
   "Syncing {}…": "正在同步 {}…",
   "Syncing…": "正在同步…",
   "System": "跟随系统",
-  "The linked path is unavailable on this Mac.": "此链接的路径在这台 Mac 上不存在或无法访问。",
+  "The linked path is unavailable.": "此链接的路径不存在或无法访问。",
   "This file will be moved to Trash. Put it back from Trash and the session shows up again.": "这个文件会被移到废纸篓。把它从废纸篓放回原处,会话就会重新出现。",
   "This file will be moved to the Recycle Bin. Put it back from the Recycle Bin and the session shows up again.": "这个文件会被移到回收站。从回收站还原后,会话就会重新出现。",
   "Thinking": "思考",
