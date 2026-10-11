@@ -65,10 +65,22 @@ impl AntigravityAdapter {
         Self::at(&super::home_dir().unwrap_or_default().join(".gemini"))
     }
 
-    /// `~/.gemini` 形态:索引 + 两个 app 数据目录下的 brain
+    /// `~/.gemini` 形态:索引 + 两个 app 数据目录下的 brain。
+    /// 索引库目录名随安装形态而变(桌面端/CLI/IDE;Windows 与 macOS 也不一致):
+    /// 逐候选探测实际存在的那个——曾硬编码 `antigravity-cli`,Windows 上该目录
+    /// 不存在,整库索引不可用(标题降级为转录首句、子会话标记失效;本机实测 64
+    /// 会话受影响)。都没有时**回落到上游的确定性默认 `antigravity-cli`**——
+    /// 远程缓存场景(`REMOTE_LAYOUTS` 的 `.gemini` mount)构造时目录可能还没同步,
+    /// data_roots 必须在"未同步/已同步"两态下一致,兜底不能随存在性漂移。
     fn at(gemini: &Path) -> Self {
+        const DB_DIRS: [&str; 3] = ["antigravity-cli", "antigravity", "antigravity-ide"];
+        let db = DB_DIRS
+            .iter()
+            .map(|dir| gemini.join(dir).join(DB_FILE))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| gemini.join("antigravity-cli").join(DB_FILE));
         Self::from_parts(
-            Some(gemini.join("antigravity-cli").join(DB_FILE)),
+            Some(db),
             APP_DIRS
                 .iter()
                 .map(|app| gemini.join(app).join("brain"))
@@ -740,6 +752,37 @@ impl AgentAdapter for AntigravityAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 索引库目录名随安装形态而变:逐个探测实际存在的;都没有时给出主名
+    /// (交给 index() 的 is_file 守卫;曾硬编码 antigravity-cli 导致 Windows 索引全空)
+    #[test]
+    fn index_db_path_probes_app_layout_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let gemini = dir.path();
+        // 只有 antigravity(本机 Windows 形态)
+        std::fs::create_dir_all(gemini.join("antigravity")).unwrap();
+        let primary = gemini.join("antigravity").join(DB_FILE);
+        std::fs::write(&primary, b"").unwrap();
+        assert_eq!(
+            AntigravityAdapter::at(gemini).db.as_deref(),
+            Some(primary.as_path())
+        );
+        // 两个都在:保持上游原优先(antigravity-cli 在前)
+        std::fs::create_dir_all(gemini.join("antigravity-cli")).unwrap();
+        let cli = gemini.join("antigravity-cli").join(DB_FILE);
+        std::fs::write(&cli, b"").unwrap();
+        assert_eq!(
+            AntigravityAdapter::at(gemini).db.as_deref(),
+            Some(cli.as_path())
+        );
+        // 都没有:回落到上游的确定性默认(antigravity-cli)——远程未同步时的
+        // data_roots 契约要求兜底不随存在性漂移(见 remote_mount_shaping 测试)
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            AntigravityAdapter::at(empty.path()).db.as_deref(),
+            Some(empty.path().join("antigravity-cli").join(DB_FILE).as_path())
+        );
+    }
 
     /// Antigravity 的 tool args 值常是"JSON 字符串的字符串"(双层编码):first_str 要先
     /// 按 JSON 字符串解一层(引号与转义一并还原)。只剥引号会留下转义反斜杠——本机

@@ -277,7 +277,7 @@ sessions before the agent even asks, see [Claude Code plugin](#claude-code-plugi
 **A skill, once, for every project** — the repository ships one at `skills/wake/`:
 
 ```bash
-npx skills add iAmCorey/Wake
+npx skills add still12281/Wake
 ```
 
 That works for Claude Code, Codex and anything else that reads the skills format. To do
@@ -301,11 +301,11 @@ It needs Wake 0.9.0 or later and covers macOS and Linux. Settings → Connect sh
 command with a copy button.
 
 ```bash
-claude plugin marketplace add iAmCorey/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake
+claude plugin marketplace add still12281/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake
 ```
 
 `--sparse` checks out only the plugin's folders instead of the whole repository. Inside a
-session, `/plugin marketplace add iAmCorey/Wake` and then `/plugin install wake@wake` do the
+session, `/plugin marketplace add still12281/Wake` and then `/plugin install wake@wake` do the
 same. The plugin carries no binaries of its own: it runs the `wake-cli` and `wake-mcp`
 inside your installed Wake (set `WAKE_BIN_DIR` to their folder if Wake lives somewhere
 other than the usual place). If you added the `wake` MCP server by hand earlier, remove it
@@ -345,7 +345,7 @@ those sessions. It needs Wake 0.9.0 or later and covers macOS and Linux. Setting
 shows the command with a copy button.
 
 ```bash
-codex plugin marketplace add iAmCorey/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake
+codex plugin marketplace add still12281/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake
 ```
 
 Codex runs a plugin's hook only after you trust it: start Codex, open `/hooks` and trust

@@ -791,16 +791,16 @@ project on the machine is in scope. Everything is read-only.";
 /// 一行装好 skill。`owner/repo` 形式由 vercel-labs 的 skills CLI 认,仓库里
 /// 有 `skills/` 目录即可被发现。Settings → Connect 的 Skill 卡展示的就是它,
 /// 与 `wake-cli setup` 同一个来源
-pub const SKILL_INSTALL: &str = "npx skills add iAmCorey/Wake";
+pub const SKILL_INSTALL: &str = "npx skills add still12281/Wake";
 
 /// 两家插件的安装命令,Settings → Connect、`wake-cli setup` 与文档同一个来源(tests/cli.rs 卡
 /// 文档里的写法)。插件都在 `plugins/wake/`,Claude Code 的市场是仓库根的
 /// `.claude-plugin/marketplace.json`,Codex 的是 `.agents/plugins/marketplace.json`。`--sparse`
 /// 只检出市场文件与插件目录:不加的话两家都把整个仓库克隆下来(约 6 MB、还随官网素材长),只为
 /// 读几 KB 的插件文件,Codex 每次升级市场还会重来一遍
-pub const CLAUDE_PLUGIN_INSTALL: &str = "claude plugin marketplace add iAmCorey/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake";
+pub const CLAUDE_PLUGIN_INSTALL: &str = "claude plugin marketplace add still12281/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake";
 /// 见 `CLAUDE_PLUGIN_INSTALL`
-pub const CODEX_PLUGIN_INSTALL: &str = "codex plugin marketplace add iAmCorey/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake";
+pub const CODEX_PLUGIN_INSTALL: &str = "codex plugin marketplace add still12281/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake";
 
 /// 这个平台给不给两家插件(Claude Code plugin / Codex plugin)。Windows 上不给:插件的脚本是 sh。
 /// 判断只在这里——设置页与 `wake-cli setup` 各自问它;片段函数本身不分平台,i18n 的死条目检查

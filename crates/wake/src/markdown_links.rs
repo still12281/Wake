@@ -68,7 +68,9 @@ fn resolve_link(
         return LinkTarget::Ignore;
     }
     // 盘符须先于 scheme 识别,否则 C:/... 会被交给 URL 打开器。
-    let windows = windows_path(href);
+    // Windows 上 `/E:/…`(前导斜杠 + 盘符,跨机器复制路径的常见写法)等价 `E:/…`;
+    // 其余平台上它是普通 POSIX 路径,不折算。
+    let windows = windows_path(href) || (cfg!(windows) && leading_slash_drive(href));
     let scheme = (!windows)
         .then(|| url_scheme(href))
         .flatten()
@@ -93,6 +95,7 @@ fn resolve_link(
         if !cfg!(windows) {
             return LinkTarget::Unavailable;
         }
+        let href = strip_leading_slash_drive(href);
         if let Some(path) = existing_windows_path(href) {
             return LinkTarget::File(path);
         }
@@ -190,6 +193,21 @@ fn windows_drive_path(href: &str) -> Option<PathBuf> {
         && bytes[1] == b':'
         && (bytes[2] == b'\\' || (bytes[2] == b'/' && bytes.get(3) != Some(&b'/'))))
     .then(|| PathBuf::from(href))
+}
+
+/// `/E:/…` 或 `/E:\…`(前导斜杠 + 盘符 + 分隔符):盘符路径的"网格式"写法。
+/// 只有 Windows 平台把它折算成盘符路径(见 resolve_link 的入口判定);纯判定函数。
+fn leading_slash_drive(path: &str) -> bool {
+    matches!(path.as_bytes(), [b'/', d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic())
+}
+
+/// 剥离 `leading_slash_drive` 形态的前导斜杠;其余原样返回。
+fn strip_leading_slash_drive(path: &str) -> &str {
+    if leading_slash_drive(path) {
+        &path[1..]
+    } else {
+        path
+    }
 }
 
 fn file_uri_path(href: &str) -> Option<PathBuf> {
@@ -344,6 +362,19 @@ mod tests {
                 "{href}"
             );
         }
+
+        // 前导斜杠的盘符形态:`/E:/…`(跨机器复制路径的常见写法)在 Windows 上等价 `E:/…`
+        let slashed = format!("/{}", display.replace('\\', "/"));
+        let target = resolve_link(&slashed, false, "", || None);
+        let LinkTarget::File(path) = target else {
+            panic!("{slashed:?}: {target:?}");
+        };
+        assert_eq!(path, file, "{slashed}");
+        // 不存在的 /E:/… 同样不可用(不落回相对路径猜测)
+        assert_eq!(
+            resolve_link("/C:/wake-link-test-missing/a.rs", false, "", || None),
+            LinkTarget::Unavailable
+        );
     }
 
     #[test]

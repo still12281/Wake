@@ -27,7 +27,7 @@ knowing where your agents left off in the project (see
 [Claude Code plugin](cli.md#claude-code-plugin)):
 
 ```bash
-claude plugin marketplace add iAmCorey/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake
+claude plugin marketplace add still12281/Wake --sparse .claude-plugin plugins/wake && claude plugin install wake@wake
 ```
 
 Use one or the other, not both, or the tools are listed twice.
@@ -45,7 +45,7 @@ Or install the Wake plugin instead, which adds this server and starts every new 
 knowing where your agents left off in the project (see [Codex plugin](cli.md#codex-plugin)):
 
 ```bash
-codex plugin marketplace add iAmCorey/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake
+codex plugin marketplace add still12281/Wake --sparse .agents/plugins --sparse plugins/wake && codex plugin add wake@wake
 ```
 
 Use one or the other, not both, or the tools are listed twice.

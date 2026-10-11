@@ -4,8 +4,8 @@ use anyhow::{Context as _, Result};
 use semver::Version;
 use serde::Deserialize;
 
-const LATEST_RELEASE_API: &str = "https://api.github.com/repos/iAmCorey/Wake/releases/latest";
-pub(crate) const LATEST_RELEASE_PAGE: &str = "https://github.com/iAmCorey/Wake/releases/latest";
+const LATEST_RELEASE_API: &str = "https://api.github.com/repos/still12281/Wake/releases/latest";
+pub(crate) const LATEST_RELEASE_PAGE: &str = "https://github.com/still12281/Wake/releases/latest";
 
 #[derive(Clone, Default)]
 pub(crate) enum UpdateStatus {
